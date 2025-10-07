@@ -2,6 +2,7 @@ package ai
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"goapp/internal/sqlutil"
@@ -75,6 +76,9 @@ func (c *Client) requestSQL(ctx context.Context, messages []Message) (string, er
 		return "", err
 	}
 
+	// Debug: Log the raw AI response
+	fmt.Printf("DEBUG: Raw AI response: %q\n", content)
+
 	cleaned := strings.TrimSpace(content)
 	if idx := strings.Index(cleaned, "```"); idx != -1 {
 		end := strings.LastIndex(cleaned, "```")
@@ -88,6 +92,9 @@ func (c *Client) requestSQL(ctx context.Context, messages []Message) (string, er
 	if strings.HasPrefix(strings.ToLower(cleaned), "sql") {
 		cleaned = strings.TrimSpace(cleaned[3:])
 	}
+
+	// Debug: Log the cleaned response
+	fmt.Printf("DEBUG: Cleaned SQL: %q\n", cleaned)
 
 	return cleaned, nil
 }

@@ -8,16 +8,36 @@ import (
 )
 
 type Config struct {
-	Port             int
-	DBPath           string
-	SchemaPath       string
-	HuggingFaceToken string
+	Port        int
+	DBPath      string
+	SchemaPath  string
+	LLMToken    string // Optional token for local LLM
+	LLMModel    string // Local LLM model name
+	LLMEndpoint string // Local LLM endpoint
+	XBeeConfig  XBeeConfig
+}
+
+type XBeeConfig struct {
+	DefaultBaudRate int    `json:"defaultBaudRate"`
+	DefaultDataBits int    `json:"defaultDataBits"`
+	DefaultStopBits int    `json:"defaultStopBits"`
+	DefaultParity   string `json:"defaultParity"`
+	MissionDir      string `json:"missionDir"`
 }
 
 const (
-	defaultPort       = 8000
-	defaultDBPath     = "telemetry.db"
-	defaultSchemaPath = "db_schema.sql"
+	defaultPort        = 8000
+	defaultDBPath      = "telemetry.db"
+	defaultSchemaPath  = "db_schema.sql"
+	defaultLLMEndpoint = "http://localhost:11434"
+	defaultLLMModel    = "llama3.1:8b"
+
+	// XBee defaults
+	defaultXBeeBaudRate = 9600
+	defaultXBeeDataBits = 8
+	defaultXBeeStopBits = 1
+	defaultXBeeParity   = "none"
+	defaultMissionDir   = "missions"
 )
 
 func Load() Config {
@@ -42,16 +62,63 @@ func Load() Config {
 		schemaPath = defaultSchemaPath
 	}
 
-	token := os.Getenv("HUGGING_FACE_TOKEN")
-	if token == "" {
-		token = "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"
+	// Local LLM configuration
+	llmToken := os.Getenv("LLM_TOKEN") // Optional for Ollama
+	llmModel := os.Getenv("LLM_MODEL")
+	if llmModel == "" {
+		llmModel = defaultLLMModel
+	}
+	llmEndpoint := os.Getenv("LLM_ENDPOINT")
+	if llmEndpoint == "" {
+		llmEndpoint = defaultLLMEndpoint
+	}
+
+	// XBee configuration
+	xbeeBaudRate := defaultXBeeBaudRate
+	if val := os.Getenv("XBEE_BAUD_RATE"); val != "" {
+		if parsed, err := strconv.Atoi(val); err == nil {
+			xbeeBaudRate = parsed
+		}
+	}
+
+	xbeeDataBits := defaultXBeeDataBits
+	if val := os.Getenv("XBEE_DATA_BITS"); val != "" {
+		if parsed, err := strconv.Atoi(val); err == nil {
+			xbeeDataBits = parsed
+		}
+	}
+
+	xbeeStopBits := defaultXBeeStopBits
+	if val := os.Getenv("XBEE_STOP_BITS"); val != "" {
+		if parsed, err := strconv.Atoi(val); err == nil {
+			xbeeStopBits = parsed
+		}
+	}
+
+	xbeeParity := os.Getenv("XBEE_PARITY")
+	if xbeeParity == "" {
+		xbeeParity = defaultXBeeParity
+	}
+
+	missionDir := os.Getenv("MISSION_DIR")
+	if missionDir == "" {
+		missionDir = defaultMissionDir
 	}
 
 	return Config{
-		Port:             port,
-		DBPath:           dbPath,
-		SchemaPath:       schemaPath,
-		HuggingFaceToken: token,
+		Port:        port,
+		DBPath:      dbPath,
+		SchemaPath:  schemaPath,
+		LLMToken:    llmToken,
+		LLMModel:    llmModel,
+		LLMEndpoint: llmEndpoint,
+		XBeeConfig: XBeeConfig{
+			DefaultBaudRate: xbeeBaudRate,
+			DefaultDataBits: xbeeDataBits,
+			DefaultStopBits: xbeeStopBits,
+			DefaultParity:   xbeeParity,
+			MissionDir:      missionDir,
+		},
 	}
 }
 

@@ -1,112 +1,50 @@
 package telemetry
 
 import (
-	"context"
 	"database/sql"
-	"errors"
-	"fmt"
-	"os"
-	"path/filepath"
+	"goapp/internal/models"
+
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+	_ "modernc.org/sqlite" // Pure Go SQLite driver
 )
 
-func EnsureSchema(ctx context.Context, db *sql.DB, schemaPath string) error {
-	exists, err := tableExists(ctx, db, "telemetry")
-	if err != nil {
-		return err
-	}
-	if exists {
-		return nil
-	}
-
-	schemaBytes, err := readSchema(schemaPath)
-	if err != nil {
-		return err
-	}
-	if _, err := db.ExecContext(ctx, string(schemaBytes)); err != nil {
-		return fmt.Errorf("apply schema: %w", err)
-	}
-	return nil
-}
-
-func readSchema(schemaPath string) ([]byte, error) {
-	candidates := []string{schemaPath}
-
-	if !filepath.IsAbs(schemaPath) {
-		candidates = append(candidates, filepath.Join("..", schemaPath))
-		candidates = append(candidates, filepath.Join("..", "server", schemaPath))
-	}
-
-	var lastErr error
-	for _, candidate := range candidates {
-		data, err := os.ReadFile(candidate)
-		if err == nil {
-			return data, nil
-		}
-		lastErr = err
-	}
-
-	if lastErr != nil {
-		return nil, fmt.Errorf("read schema file: %w", lastErr)
-	}
-	return nil, fmt.Errorf("read schema file: schema not found")
-}
-
-func tableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {
-	var name string
-	err := db.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&name)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return name == table, nil
-}
-
-func GetTelemetry(ctx context.Context, db *sql.DB) ([]map[string]any, error) {
-	return Query(ctx, db, "SELECT * FROM telemetry")
-}
-
-func Query(ctx context.Context, db *sql.DB, sql string) ([]map[string]any, error) {
-	rows, err := db.QueryContext(ctx, sql)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	columns, err := rows.Columns()
+func EnsureSchema(dbPath string) (*gorm.DB, error) {
+	// Use pure Go SQLite driver by opening with sql.Open first
+	sqlDB, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, err
 	}
 
-	results := make([]map[string]any, 0)
-
-	for rows.Next() {
-		values := make([]any, len(columns))
-		valuePtrs := make([]any, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			return nil, err
-		}
-
-		rowMap := make(map[string]any, len(columns))
-		for i, col := range columns {
-			val := values[i]
-			if b, ok := val.([]byte); ok {
-				rowMap[col] = string(b)
-			} else {
-				rowMap[col] = val
-			}
-		}
-		results = append(results, rowMap)
-	}
-
-	if err := rows.Err(); err != nil {
+	// Create GORM DB instance using the existing sql.DB connection
+	db, err := gorm.Open(sqlite.Dialector{
+		Conn: sqlDB,
+	}, &gorm.Config{})
+	if err != nil {
+		sqlDB.Close()
 		return nil, err
 	}
 
+	// Auto migrate the schema
+	if err := db.AutoMigrate(&models.Telemetry{}); err != nil {
+		return nil, err
+	}
+
+	return db, nil
+}
+
+func GetTelemetry(db *gorm.DB) ([]models.Telemetry, error) {
+	var telemetries []models.Telemetry
+	if err := db.Find(&telemetries).Error; err != nil {
+		return nil, err
+	}
+	return telemetries, nil
+}
+
+func Query(db *gorm.DB, sql string) ([]map[string]interface{}, error) {
+	var results []map[string]interface{}
+	if err := db.Raw(sql).Scan(&results).Error; err != nil {
+		return nil, err
+	}
 	return results, nil
 }

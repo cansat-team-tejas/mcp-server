@@ -1,0 +1,31 @@
+CanSat Telemetry System Overview:
+
+The CanSat is a student-built satellite that collects various telemetry data during flight. Key parameters include:
+
+- Altitude: Measured in meters, typically ranges from ground level to target apogee
+- Pressure: Atmospheric pressure in hPa, decreases with altitude
+- Temperature: Ambient temperature in Celsius
+- Voltage: Battery voltage, should remain above 3.0V for proper operation
+- GPS Data: Latitude, longitude, and GPS altitude for position tracking
+- Orientation: Roll, pitch, yaw angles from IMU sensors
+- Flight States: Different phases of flight (pre-launch, ascent, descent, landed)
+- Health Flags: System status indicators
+
+Typical mission profile:
+1. Pre-launch: System initialization and ground checks
+2. Launch: Rapid ascent with increasing altitude
+3. Apogee: Peak altitude, deployment of recovery systems
+4. Descent: Parachute deployment and controlled descent
+5. Landing: Touchdown and data transmission
+
+Key performance metrics:
+- Target altitude: Usually 300-500 meters for student competitions
+- Flight duration: 5-15 minutes total
+- Data transmission: Real-time telemetry via radio or cellular
+- Recovery: GPS-guided recovery system
+
+Safety considerations:
+- Battery monitoring to prevent power loss
+- Altitude limits to stay within FAA regulations
+- Emergency recovery procedures
+- Data logging for post-flight analysis
