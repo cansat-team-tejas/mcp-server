@@ -198,3 +198,73 @@ func (sm *SerialManager) GetStatus() map[string]interface{} {
 func (sm *SerialManager) IsOpen() bool {
 	return sm.isOpen
 }
+
+// DetectXBeePort attempts to automatically detect an XBee device
+// Returns the port path and info if found, empty string if not found
+func (sm *SerialManager) DetectXBeePort() (string, PortInfo, error) {
+	ports, err := sm.ListPorts()
+	if err != nil {
+		return "", PortInfo{}, err
+	}
+
+	// Common XBee vendor IDs and patterns
+	xbeeIndicators := []struct {
+		vendorID    string
+		productID   string
+		description string
+	}{
+		{"0403", "6001", "FT232"},  // FTDI-based XBee adapters
+		{"0403", "6015", "FT231"},  // FTDI FT231X
+		{"10C4", "EA60", "CP210x"}, // Silicon Labs CP210x
+		{"067B", "2303", "PL2303"}, // Prolific PL2303
+		{"", "", "XBee"},           // Generic XBee in description
+		{"", "", "USB Serial"},     // Generic USB serial
+		{"2341", "", "Arduino"},    // Arduino with XBee shield
+	}
+
+	for _, port := range ports {
+		for _, indicator := range xbeeIndicators {
+			matched := false
+
+			// Check vendor ID match
+			if indicator.vendorID != "" && port.VendorID == indicator.vendorID {
+				if indicator.productID == "" || port.ProductID == indicator.productID {
+					matched = true
+				}
+			}
+
+			// Check description match
+			if indicator.description != "" && port.Description != "" {
+				if contains(port.Description, indicator.description) {
+					matched = true
+				}
+			}
+
+			if matched {
+				log.Printf("Auto-detected XBee device: %s (%s)", port.Name, port.Description)
+				return port.Name, port, nil
+			}
+		}
+	}
+
+	return "", PortInfo{}, fmt.Errorf("no XBee device detected")
+}
+
+// Helper function for case-insensitive string contains
+func contains(s, substr string) bool {
+	if s == "" || substr == "" {
+		return false
+	}
+	// Simple substring search
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+// GetPortPath returns the currently connected port path
+func (sm *SerialManager) GetPortPath() string {
+	return sm.portPath
+}

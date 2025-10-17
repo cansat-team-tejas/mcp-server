@@ -8,6 +8,7 @@ import (
 type Response struct {
 	Success bool       `json:"success"`
 	Error   string     `json:"error,omitempty"`
+	Message string     `json:"message,omitempty"`
 	Ports   []PortInfo `json:"ports,omitempty"`
 }
 
@@ -86,3 +87,9 @@ type WSResponse struct {
 	Error   string      `json:"error,omitempty"`
 	Data    interface{} `json:"data,omitempty"`
 }
+
+// Command and Response Log structures for GS communication tracking
+// Legacy log types previously exposed via the API have been replaced by
+// structures defined in communication_store.go. They are intentionally
+// omitted here to avoid duplication and reduce coupling between
+// transport types and the logging subsystem.

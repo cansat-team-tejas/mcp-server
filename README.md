@@ -5,6 +5,7 @@ This Go application provides a comprehensive REST API for CanSat telemetry data 
 ## Features
 
 - **XBee Serial Communication**: Full XBee integration with frame processing, command sending, and live telemetry streaming
+- **Hands-Free XBee Connection**: Automatic detect/connect/reconnect cycle with no GUI action required
 - **Mission Management**: Automatic mission creation with START command detection and per-mission databases
 - **Live Data Streaming**: WebSocket endpoints for real-time telemetry and status updates
 - **Conversation History**: Complete tracking of all mission communications (commands, telemetry, responses)
@@ -60,33 +61,27 @@ go run ./cmd/demo  # Demonstrates AI instructions configuration
 
 The server listens on `http://localhost:8000` by default.
 
+## GUI Integration Quick Reference
+
+The GUI can rely on the MCP server for everything from database access to XBee connectivity. Key endpoints:
+
+📚 **Need the exact contracts?** Check the dedicated [GUI_API_REFERENCE.md](./GUI_API_REFERENCE.md).
+
+- `GET /api/xbee/status` – live connection + mission status (auto-connected on startup)
+- `GET /api/xbee/health` – connection health metrics (latency, last packet, uptime)
+- `GET /api/xbee/logs` – combined command/response history for mission review
+- `GET /api/xbee/logs/commands` – ground commands that were transmitted
+- `GET /api/xbee/logs/responses` – frames received from the CanSat (excluding telemetry)
+- `WS /api/xbee/ws` – live telemetry, activity, and command streaming channel
+- Link configuration: 115200 baud, point-to-point, remote address `0013A20042367EBB`
+- `POST /ask` – natural-language questions about telemetry + command detection
+- `POST /data` – raw telemetry pull for dashboards
+
 ## API Endpoints
 
-All endpoints expect JSON payloads and return JSON responses. Each request must include a `filename` parameter specifying the SQLite database file to operate on.
+All endpoints expect JSON payloads and return JSON responses. Each request must include a `filename` parameter. Filenames are always resolved inside the configured `missions` directory.
 
-### 1. Create Database
-
-**POST** `/create-db`
-
-Creates a new SQLite database file with the required tables.
-
-**Request:**
-
-```json
-{
-  "filename": "mission1.db"
-}
-```
-
-**Response:**
-
-```json
-{
-  "message": "Database created successfully"
-}
-```
-
-### 2. Ask Questions
+### 1. Ask Questions
 
 **POST** `/ask`
 
@@ -114,7 +109,7 @@ If the specified database file doesn't exist, falls back to answering based on s
 }
 ```
 
-### 3. Get Telemetry Data
+### 2. Get Telemetry Data
 
 **POST** `/data`
 
@@ -141,41 +136,6 @@ Returns all telemetry data points from the specified database.
     // ... all telemetry fields
   }
 ]
-```
-
-### 4. Insert Telemetry Data
-
-**POST** `/insert-data`
-
-Inserts a new telemetry data point into the database.
-
-**Request:**
-
-```json
-{
-  "filename": "mission1.db",
-  "TEAM_ID": "TEJAS",
-  "mission_time_s": 120.5,
-  "packet_count": 45,
-  "altitude": 1250.5,
-  "pressure": 1013.25,
-  "temperature": 25.3,
-  "voltage": 3.7,
-  "latitude": 12.9716,
-  "longitude": 77.5946,
-  "satellites": 8,
-  "flight_state": 2
-  // ... other optional fields
-}
-```
-
-**Response:**
-
-```json
-{
-  "message": "Data inserted successfully",
-  "id": 123
-}
 ```
 
 ## AI Chat API Endpoints
@@ -296,67 +256,13 @@ Health check for AI service availability.
 
 The XBee module provides comprehensive serial communication capabilities for CanSat missions, including real-time telemetry streaming, command transmission, and mission management.
 
-### Connection Management
+### Connection Monitoring (Automatic)
 
-#### GET `/api/xbee/ports`
-
-Lists available serial ports for XBee connection.
-
-**Response:**
-
-```json
-{
-  "success": true,
-  "ports": [
-    {
-      "name": "COM3",
-      "description": "USB Serial Port"
-    }
-  ]
-}
-```
-
-#### POST `/api/xbee/connect`
-
-Connects to XBee module via serial port.
-
-**Request:**
-
-```json
-{
-  "port": "COM3",
-  "config": {
-    "baudRate": 9600,
-    "dataBits": 8,
-    "stopBits": 1,
-    "parity": "none"
-  }
-}
-```
-
-**Response:**
-
-```json
-{
-  "success": true
-}
-```
-
-#### POST `/api/xbee/disconnect`
-
-Disconnects from XBee module.
-
-**Response:**
-
-```json
-{
-  "success": true
-}
-```
+The MCP server automatically scans available serial ports on startup, connects to the detected XBee, and continually retries if the device is unplugged or reboots. The GUI **does not** need to expose manual connect/disconnect controls—just surface status and health data from the endpoints below.
 
 #### GET `/api/xbee/status`
 
-Gets current connection status, mission info, and statistics.
+Returns current connection state, mission info, and latest statistics from the auto-managed link.
 
 **Response:**
 
@@ -367,7 +273,7 @@ Gets current connection status, mission info, and statistics.
     "isOpen": true,
     "port": "COM3",
     "config": {
-      "baudRate": 9600,
+      "baudRate": 115200,
       "dataBits": 8,
       "stopBits": 1,
       "parity": "none"
@@ -408,7 +314,7 @@ Gets current connection status, mission info, and statistics.
 
 #### GET `/api/xbee/health`
 
-Gets detailed connection health information and diagnostics.
+Provides connection health diagnostics sourced from the auto-connect service.
 
 **Response:**
 
@@ -458,6 +364,42 @@ Sends commands to XBee module. Special handling for "START" command which create
   "success": true
 }
 ```
+
+### Communication Logs
+
+The server captures every command sent to the XBee and every non-telemetry frame received, retaining the 10,000 most recent events in memory. Use these endpoints for GUI displays or mission debugging.
+
+#### GET `/api/xbee/logs`
+
+Returns combined command and response history with timestamps and mission correlation.
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "logs": [
+    {
+      "type": "command",
+      "timestamp": "2023-10-08T10:05:00Z",
+      "command": "START"
+    },
+    {
+      "type": "response",
+      "timestamp": "2023-10-08T10:05:01Z",
+      "response": "START_ACK"
+    }
+  ]
+}
+```
+
+#### GET `/api/xbee/logs/commands`
+
+Returns only the commands that were transmitted to the spacecraft.
+
+#### GET `/api/xbee/logs/responses`
+
+Returns only the non-telemetry frames received from the spacecraft.
 
 ### Mission Management
 
@@ -787,7 +729,7 @@ All frames are automatically logged in the conversation history with appropriate
 - **AI Chat Streaming**: Real-time AI responses via WebSocket and Server-Sent Events
 - **Conversation Tracking**: Complete audit trail of all mission communications stored automatically
 - **Thread Safety**: All database operations and WebSocket connections are thread-safe
-- **Auto-Migration**: Database schemas are created automatically when first accessed
+- **Auto-Migration**: Telemetry (`telemetry`) and mission conversation (`conversation_histories`) tables are created/renamed automatically when first accessed
 - **Local AI**: Uses Ollama for local AI processing without external API dependencies
 - **Multi-protocol Support**: HTTP REST, WebSocket, and SSE for different client needs
 - **Frame Processing**: Robust XBee frame parsing with error handling and logging
@@ -812,7 +754,7 @@ go build -o mcp-server.exe ./cmd
 
 - Verify XBee module is properly connected
 - Check COM port availability and permissions
-- Ensure correct baud rate configuration (typically 9600)
+- Ensure correct baud rate configuration (115200 for the current CanSat link)
 - Verify XBee firmware supports frame-based communication
 - **Connection Monitoring**: Use `/api/xbee/health` to check connection status
 - **Automatic Detection**: System detects disconnections after 5 consecutive read errors

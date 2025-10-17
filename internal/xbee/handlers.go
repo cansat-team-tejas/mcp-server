@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"github.com/gofiber/fiber/v2"
+	websocket "github.com/gofiber/websocket/v2"
 )
 
 // XBeeHandlers provides HTTP handlers for all XBee-related API endpoints.
@@ -22,50 +23,20 @@ func NewXBeeHandlers(service *XBeeService) *XBeeHandlers {
 	}
 }
 
+// WebSocket upgrade guard for Fiber routes
+func (h *XBeeHandlers) handleWebSocketUpgrade(c *fiber.Ctx) error {
+	if websocket.IsWebSocketUpgrade(c) {
+		return c.Next()
+	}
+	return fiber.ErrUpgradeRequired
+}
+
 // WebSocket endpoint for live streaming
-func (h *XBeeHandlers) HandleWebSocket(c *fiber.Ctx) error {
-	return fiber.NewError(fiber.StatusUpgradeRequired, "WebSocket connection required")
+func (h *XBeeHandlers) HandleWebSocketConnection(conn *websocket.Conn) {
+	h.service.ServeWebSocketConn(conn)
 }
 
 // REST API Handlers
-
-// GET /api/xbee/ports - List available serial ports
-func (h *XBeeHandlers) ListPorts(c *fiber.Ctx) error {
-	response := h.service.ListPorts()
-	return c.JSON(response)
-}
-
-// POST /api/xbee/connect - Connect to XBee
-func (h *XBeeHandlers) Connect(c *fiber.Ctx) error {
-	var req struct {
-		Port   string       `json:"port"`
-		Config SerialConfig `json:"config"`
-	}
-
-	if err := c.BodyParser(&req); err != nil {
-		return c.Status(400).JSON(Response{
-			Success: false,
-			Error:   "Invalid request body",
-		})
-	}
-
-	response := h.service.OpenPort(req.Port, req.Config)
-	if !response.Success {
-		return c.Status(500).JSON(response)
-	}
-
-	return c.JSON(response)
-}
-
-// POST /api/xbee/disconnect - Disconnect from XBee
-func (h *XBeeHandlers) Disconnect(c *fiber.Ctx) error {
-	response := h.service.ClosePort()
-	if !response.Success {
-		return c.Status(500).JSON(response)
-	}
-
-	return c.JSON(response)
-}
 
 // GET /api/xbee/status - Get connection status
 func (h *XBeeHandlers) GetStatus(c *fiber.Ctx) error {
@@ -377,14 +348,42 @@ func (h *XBeeHandlers) GetConnectionHealth(c *fiber.Ctx) error {
 	})
 }
 
+// GET /api/xbee/logs - Get all communication logs
+
+// GET /api/xbee/logs - Get all communication logs
+func (h *XBeeHandlers) GetCommunicationLogs(c *fiber.Ctx) error {
+	logs := h.service.GetCommunicationLogs()
+	return c.JSON(map[string]interface{}{
+		"success": true,
+		"logs":    logs,
+	})
+}
+
+// GET /api/xbee/logs/commands - Get command logs only
+func (h *XBeeHandlers) GetCommandLogs(c *fiber.Ctx) error {
+	commands := h.service.GetCommandLogs()
+	return c.JSON(map[string]interface{}{
+		"success":  true,
+		"commands": commands,
+		"total":    len(commands),
+	})
+}
+
+// GET /api/xbee/logs/responses - Get response logs only
+func (h *XBeeHandlers) GetResponseLogs(c *fiber.Ctx) error {
+	responses := h.service.GetResponseLogs()
+	return c.JSON(map[string]interface{}{
+		"success":   true,
+		"responses": responses,
+		"total":     len(responses),
+	})
+}
+
 // Register all routes
 func (h *XBeeHandlers) RegisterRoutes(app *fiber.App) {
 	xbee := app.Group("/api/xbee")
 
-	// Connection management
-	xbee.Get("/ports", h.ListPorts)
-	xbee.Post("/connect", h.Connect)
-	xbee.Post("/disconnect", h.Disconnect)
+	// Connection monitoring (auto-connect is handled by the service internally)
 	xbee.Get("/status", h.GetStatus)
 	xbee.Get("/health", h.GetConnectionHealth)
 
@@ -405,8 +404,14 @@ func (h *XBeeHandlers) RegisterRoutes(app *fiber.App) {
 	xbee.Get("/conversation/:missionId", h.GetConversationHistory)
 	xbee.Get("/conversation/:missionId/all", h.GetAllConversationHistory)
 
-	// WebSocket endpoint (will be handled separately)
-	// xbee.Get("/ws", websocket.New(h.HandleWebSocketConnection))
+	// Communication logs
+	xbee.Get("/logs", h.GetCommunicationLogs)
+	xbee.Get("/logs/commands", h.GetCommandLogs)
+	xbee.Get("/logs/responses", h.GetResponseLogs)
+
+	// WebSocket endpoint for live telemetry and command streaming
+	xbee.Use("/ws", h.handleWebSocketUpgrade)
+	xbee.Get("/ws", websocket.New(h.HandleWebSocketConnection))
 }
 
 // Helper function to create WebSocket response

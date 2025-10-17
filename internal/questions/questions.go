@@ -3,13 +3,10 @@ package questions
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
-
 	"goapp/internal/ai"
 	"goapp/internal/commands"
 	"goapp/internal/sqlutil"
-	"goapp/internal/telemetry"
+	"strings"
 
 	"gorm.io/gorm"
 )
@@ -20,6 +17,7 @@ type Answer struct {
 }
 
 func AnswerQuestion(ctx context.Context, question string, db *gorm.DB, client *ai.Client, fallbackContext string) (Answer, error) {
+	// Handle commands first
 	commandEntries := commands.DetectCommandRequest(question)
 	if len(commandEntries) > 0 {
 		codes := make([]string, 0, len(commandEntries))
@@ -34,175 +32,190 @@ func AnswerQuestion(ctx context.Context, question string, db *gorm.DB, client *a
 		}, nil
 	}
 
-	// If no database, use fallback context
+	// Check if this is a general knowledge question using MCP-style classification
+	needsData, err := classifyQuestionWithMCP(ctx, client, question)
+	if err != nil {
+		needsData = true // Default to requiring data if classification fails
+	}
+
+	if !needsData {
+		// Use MCP-style context-aware AI response for general questions
+		response, err := handleGeneralQuestionWithMCP(ctx, client, question)
+		if err != nil {
+			return Answer{}, fmt.Errorf("llm response: %w", err)
+		}
+		return Answer{Content: response}, nil
+	}
+
+	// If no database available, use fallback context
 	if db == nil {
-		systemInstruction := "You are an engaging telemetry data assistant. Use the provided context to craft a friendly, insight-rich reply, reference concrete numbers, and explain what they mean. Present the answer in short paragraphs or bullet lists."
-		userMessage := fmt.Sprintf("User question: %s\nContext:\n%s\nRespond conversationally while staying grounded in the data.", question, fallbackContext)
-
-		message := []ai.Message{
-			{Role: "system", Content: systemInstruction},
-			{Role: "user", Content: userMessage},
-		}
-
-		response, err := client.Chat(ctx, message)
+		response, err := handleFallbackResponse(ctx, client, question, fallbackContext)
 		if err != nil {
-			return Answer{}, fmt.Errorf("llm response: %w", err)
+			return Answer{}, fmt.Errorf("fallback response: %w", err)
 		}
-
 		return Answer{Content: response}, nil
 	}
 
-	// Check if this is a general knowledge question that doesn't need database access
-	if !requiresDataAccess(question) {
-		systemInstruction := "You are a helpful assistant for CanSat mission operations. Answer questions about CanSat systems, aerospace engineering, and mission planning with accurate, educational information."
+	// Handle data-requiring questions with MCP-style data context
+	return handleDataQuestionWithMCP(ctx, client, db, question)
+}
 
-		message := []ai.Message{
-			{Role: "system", Content: systemInstruction},
-			{Role: "user", Content: question},
-		}
+// classifyQuestionWithMCP uses MCP-style classification for question routing
+func classifyQuestionWithMCP(ctx context.Context, client *ai.Client, question string) (bool, error) {
+	systemPrompt := `You are an MCP (Model Context Protocol) classifier for a CanSat telemetry system.
+Your role is to route questions to the appropriate context handler.
 
-		response, err := client.Chat(ctx, message)
-		if err != nil {
-			return Answer{}, fmt.Errorf("llm response: %w", err)
-		}
+Classification Rules:
+- DATA: Questions requiring telemetry database access, sensor readings, measurements
+- GENERAL: Conceptual questions, definitions, greetings, explanations
 
-		return Answer{Content: response}, nil
+Respond with exactly one word: DATA or GENERAL
+
+Examples:
+"What is the latest altitude?" → DATA
+"Hi there!" → GENERAL
+"Explain CanSat systems" → GENERAL
+"Show temperature trends" → DATA`
+
+	messages := []ai.Message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: fmt.Sprintf("Classify: %s", question)},
 	}
 
+	response, err := client.Chat(ctx, messages)
+	if err != nil {
+		return true, err
+	}
+
+	response = strings.TrimSpace(strings.ToUpper(response))
+	return response == "DATA", nil
+}
+
+// handleGeneralQuestionWithMCP handles general knowledge questions using MCP context
+func handleGeneralQuestionWithMCP(ctx context.Context, client *ai.Client, question string) (string, error) {
+	// Use the AI instructions system with default context for general questions
+	return client.ChatWithContext(ctx, []ai.Message{
+		{Role: "user", Content: question},
+	}, "default")
+}
+
+// handleFallbackResponse handles questions when no database is available
+func handleFallbackResponse(ctx context.Context, client *ai.Client, question string, fallbackContext string) (string, error) {
+	systemInstruction := "You are an engaging telemetry data assistant. Use the provided context to craft a friendly, insight-rich reply, reference concrete numbers, and explain what they mean. Present the answer in short paragraphs or bullet lists."
+	userMessage := fmt.Sprintf("User question: %s\nContext:\n%s\nRespond conversationally while staying grounded in the data.", question, fallbackContext)
+
+	messages := []ai.Message{
+		{Role: "system", Content: systemInstruction},
+		{Role: "user", Content: userMessage},
+	}
+
+	return client.Chat(ctx, messages)
+}
+
+// handleDataQuestionWithMCP handles data-requiring questions with MCP-style context
+func handleDataQuestionWithMCP(ctx context.Context, client *ai.Client, db *gorm.DB, question string) (Answer, error) {
+	// Generate SQL using the existing method
 	rawSQL, err := client.GenerateSQL(ctx, question)
 	if err != nil {
 		return Answer{}, fmt.Errorf("generate sql: %w", err)
 	}
 
-	sql, meta := sqlutil.StripSQLMetadata(rawSQL)
+	sql, _ := sqlutil.StripSQLMetadata(rawSQL)
 	if sql == "" || !strings.HasPrefix(strings.ToLower(sql), "select") {
 		return Answer{Content: fmt.Sprintf("AI could not generate a valid SQL query.\nAI output: %s", rawSQL)}, nil
 	}
 
-	rows, err := telemetry.Query(db, sql)
+	// Query the database
+	rows, err := queryDatabase(db, sql)
 	if err != nil {
 		return Answer{}, fmt.Errorf("run query: %w", err)
 	}
 
-	contextSections := make([]string, 0, 2)
-	if len(rows) > 0 {
-		contextSections = append(contextSections, telemetry.FormatResultsForPrompt(question, rows))
-	} else {
-		contextSections = append(contextSections, "No rows were returned for this query.")
-	}
+	// Generate MCP-style response with telemetry context
+	return generateMCPResponse(ctx, client, question, rows)
+}
 
-	if len(meta) > 0 {
-		metaPairs := make([]string, 0, len(meta))
-		for k, v := range meta {
-			metaPairs = append(metaPairs, fmt.Sprintf("%s=%s", k, v))
-		}
-		if len(rows) > 0 {
-			if targetAlt, ok := meta["target_altitude"]; ok {
-				if firstAlt, okFirst := toFloat(rows[0]["altitude"]); okFirst {
-					if target, err := strconv.ParseFloat(targetAlt, 64); err == nil {
-						delta := firstAlt - target
-						metaPairs = append(metaPairs, fmt.Sprintf("altitude_delta=%s", telemetry.FormatValue(delta)))
-					}
-				}
-			}
-		}
-		contextSections = append(contextSections, "Metadata hints: "+strings.Join(metaPairs, "; "))
-	}
-
-	contextText := strings.Join(contextSections, "\n")
-
-	systemInstruction := "You are an engaging telemetry data assistant. Use the provided context to craft a friendly, insight-rich reply, reference concrete numbers, and explain what they mean. Present the answer in short paragraphs or bullet lists."
-	userMessage := fmt.Sprintf("User question: %s\nSQL executed: %s\nContext:\n%s\nRespond conversationally while staying grounded in the data.", question, sql, contextText)
-
-	message := []ai.Message{
-		{Role: "system", Content: systemInstruction},
-		{Role: "user", Content: userMessage},
-	}
-
-	response, err := client.Chat(ctx, message)
+// queryDatabase executes the SQL query and returns results
+func queryDatabase(db *gorm.DB, sql string) ([]map[string]interface{}, error) {
+	rows, err := db.Raw(sql).Rows()
 	if err != nil {
-		return Answer{}, fmt.Errorf("llm response: %w", err)
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return nil, err
+		}
+
+		row := make(map[string]interface{})
+		for i, col := range columns {
+			row[col] = values[i]
+		}
+		results = append(results, row)
+	}
+
+	return results, nil
+}
+
+// generateMCPResponse creates a context-aware response using MCP principles
+func generateMCPResponse(ctx context.Context, client *ai.Client, question string, data []map[string]interface{}) (Answer, error) {
+	var contextStr string
+	if len(data) == 0 {
+		contextStr = "No data found for your query."
+	} else {
+		contextStr = formatDataForMCP(data)
+	}
+
+	// Use telemetry context for data-driven responses
+	response, err := client.ChatWithContext(ctx, []ai.Message{
+		{Role: "user", Content: fmt.Sprintf("Question: %s\n\nData Context:\n%s", question, contextStr)},
+	}, "telemetry")
+
+	if err != nil {
+		return Answer{}, err
 	}
 
 	return Answer{Content: response}, nil
 }
 
-// requiresDataAccess determines if a question needs telemetry data access
-func requiresDataAccess(question string) bool {
-	lowerQ := strings.ToLower(question)
-
-	// Keywords that indicate data access is needed
-	dataKeywords := []string{
-		"altitude", "temperature", "pressure", "voltage", "humidity", "current", "power",
-		"telemetry", "sensor", "reading", "measurement", "data", "value", "record",
-		"latest", "recent", "highest", "lowest", "average", "maximum", "minimum",
-		"when", "time", "epoch", "mission_time", "packet_count",
-		"gps", "latitude", "longitude", "satellites", "gnss",
-		"accelerometer", "gyro", "magnetometer", "accel", "gyro", "mag",
-		"flight_state", "health", "rssi", "battery", "baro",
-		"analyze", "show me", "what was", "how many", "list", "display",
+// formatDataForMCP formats query results for MCP context
+func formatDataForMCP(data []map[string]interface{}) string {
+	if len(data) == 0 {
+		return "No data available."
 	}
 
-	// Check if question contains data-related keywords
-	for _, keyword := range dataKeywords {
-		if strings.Contains(lowerQ, keyword) {
-			return true
+	var result strings.Builder
+	result.WriteString(fmt.Sprintf("Found %d record(s):\n", len(data)))
+
+	for i, row := range data {
+		if i >= 5 { // Limit to first 5 records for context
+			result.WriteString(fmt.Sprintf("... and %d more records\n", len(data)-i))
+			break
 		}
-	}
 
-	// General knowledge questions that don't need data
-	generalKeywords := []string{
-		"what is", "what are", "how does", "explain", "define", "meaning",
-		"cansat", "satellite", "aerospace", "engineering", "mission",
-		"how to", "why", "purpose", "concept", "theory", "principle",
-	}
-
-	// If it's clearly a general knowledge question, return false
-	for _, keyword := range generalKeywords {
-		if strings.Contains(lowerQ, keyword) && !containsDataKeywords(lowerQ, dataKeywords) {
-			return false
+		result.WriteString(fmt.Sprintf("Record %d: ", i+1))
+		var pairs []string
+		for key, value := range row {
+			if value != nil {
+				pairs = append(pairs, fmt.Sprintf("%s=%v", key, value))
+			}
 		}
+		result.WriteString(strings.Join(pairs, ", "))
+		result.WriteString("\n")
 	}
 
-	// Default to requiring data access if uncertain
-	return true
-}
-
-func containsDataKeywords(text string, keywords []string) bool {
-	for _, keyword := range keywords {
-		if strings.Contains(text, keyword) {
-			return true
-		}
-	}
-	return false
-}
-
-func toFloat(value any) (float64, bool) {
-	switch v := value.(type) {
-	case nil:
-		return 0, false
-	case float32:
-		return float64(v), true
-	case float64:
-		return v, true
-	case int:
-		return float64(v), true
-	case int64:
-		return float64(v), true
-	case uint:
-		return float64(v), true
-	case uint64:
-		return float64(v), true
-	case string:
-		if v == "" {
-			return 0, false
-		}
-		value, err := strconv.ParseFloat(v, 64)
-		if err != nil {
-			return 0, false
-		}
-		return value, true
-	default:
-		return 0, false
-	}
+	return result.String()
 }

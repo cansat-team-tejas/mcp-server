@@ -1,32 +1,50 @@
 package telemetry
 
 import (
-	"database/sql"
+	"fmt"
+	"os"
+	"path/filepath"
+
 	"goapp/internal/models"
 
-	"gorm.io/driver/sqlite"
+	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
-	_ "modernc.org/sqlite" // Pure Go SQLite driver
 )
 
 func EnsureSchema(dbPath string) (*gorm.DB, error) {
-	// Use pure Go SQLite driver by opening with sql.Open first
-	sqlDB, err := sql.Open("sqlite", dbPath)
+	if dbPath == "" {
+		return nil, fmt.Errorf("database path is empty")
+	}
+
+	absPath, err := filepath.Abs(dbPath)
 	if err != nil {
 		return nil, err
 	}
 
-	// Create GORM DB instance using the existing sql.DB connection
-	db, err := gorm.Open(sqlite.Dialector{
-		Conn: sqlDB,
-	}, &gorm.Config{})
-	if err != nil {
-		sqlDB.Close()
+	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
 		return nil, err
+	}
+
+	db, err := gorm.Open(sqlite.Open(absPath), &gorm.Config{})
+	if err != nil {
+		return nil, err
+	}
+
+	migrator := db.Migrator()
+	if migrator.HasTable("telemetries") && !migrator.HasTable("telemetry") {
+		if err := migrator.RenameTable("telemetries", "telemetry"); err != nil {
+			return nil, err
+		}
+	}
+
+	if migrator.HasTable("conversation_history") && !migrator.HasTable("conversation_histories") {
+		if err := migrator.RenameTable("conversation_history", "conversation_histories"); err != nil {
+			return nil, err
+		}
 	}
 
 	// Auto migrate the schema
-	if err := db.AutoMigrate(&models.Telemetry{}); err != nil {
+	if err := db.AutoMigrate(&models.Telemetry{}, &models.ConversationHistory{}); err != nil {
 		return nil, err
 	}
 

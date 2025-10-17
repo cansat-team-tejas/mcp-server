@@ -26,7 +26,7 @@ func main() {
 	aiClient := ai.NewClient(cfg.LLMToken)
 
 	// Initialize XBee service
-	xbeeService, err := xbee.NewXBeeService(cfg.DBPath)
+	xbeeService, err := xbee.NewXBeeService(cfg.DBPath, cfg.XBeeConfig.MissionDir)
 	if err != nil {
 		logger.Fatalf("failed to initialize XBee service: %v", err)
 	}
@@ -48,7 +48,7 @@ func main() {
 	}))
 
 	// Register existing API routes
-	handlers := api.NewHandlers(aiClient, logger)
+	handlers := api.NewHandlers(aiClient, logger, cfg.XBeeConfig.MissionDir)
 	api.RegisterRoutes(app, handlers)
 
 	// Register AI chat handlers with streaming support
@@ -58,17 +58,6 @@ func main() {
 	// Register XBee API routes
 	xbeeHandlers := xbee.NewXBeeHandlers(xbeeService)
 	xbeeHandlers.RegisterRoutes(app)
-
-	// Add WebSocket endpoint for XBee live streaming - simplified approach
-	app.Get("/api/xbee/ws", func(c *fiber.Ctx) error {
-		// For now, return an informational message
-		// WebSocket integration will be handled separately
-		return c.JSON(map[string]interface{}{
-			"message": "WebSocket endpoint available",
-			"note":    "Use WebSocket client to connect for live streaming",
-			"stats":   xbeeService.GetStats(),
-		})
-	})
 
 	go func() {
 		if err := app.Listen(cfg.ListenAddress()); err != nil {

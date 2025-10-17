@@ -2,13 +2,13 @@ package database
 
 import (
 	"log"
+	"os"
 	"path/filepath"
 	"time"
 
-	"gorm.io/driver/sqlite"
+	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
-	_ "modernc.org/sqlite"
 
 	"goapp/internal/models"
 )
@@ -29,6 +29,10 @@ func NewDatabase(dbPath string) (*Database, error) {
 	// Create absolute path for database
 	absPath, err := filepath.Abs(dbPath)
 	if err != nil {
+		return nil, err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
 		return nil, err
 	}
 

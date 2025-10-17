@@ -12,10 +12,13 @@
 package xbee
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,6 +28,12 @@ import (
 	"goapp/internal/models"
 	"goapp/internal/telemetry"
 )
+
+type wsClient interface {
+	WriteJSON(v interface{}) error
+	ReadJSON(v interface{}) error
+	Close() error
+}
 
 // XBeeService is the main service for managing XBee radio communication with CanSat.
 // It provides thread-safe operations for serial communication, mission management,
@@ -38,7 +47,7 @@ type XBeeService struct {
 	dataMutex     sync.RWMutex
 
 	// WebSocket connections for live streaming
-	clients      map[*websocket.Conn]bool
+	clients      map[wsClient]struct{}
 	clientsMutex sync.RWMutex
 	upgrader     websocket.Upgrader
 
@@ -54,9 +63,13 @@ type XBeeService struct {
 	activityLog   []ActivityItem
 	activityMutex sync.RWMutex
 
+	// Communication logs for commands and responses
+	commStore *communicationStore
+
 	// Database integration
-	database *gorm.DB
-	dbPath   string
+	database   *gorm.DB
+	dbPath     string
+	missionDir string
 }
 
 type ServiceStats struct {
@@ -90,20 +103,40 @@ type LiveTelemetryData struct {
 	Error     string            `json:"error,omitempty"`
 }
 
-func NewXBeeService(dbPath string) (*XBeeService, error) {
+type logPayload struct {
+	Raw            string `json:"raw"`
+	Timestamp      string `json:"timestamp,omitempty"`
+	EncodedCommand string `json:"encoded_command,omitempty"`
+}
+
+const (
+	defaultRemoteAddr64Hex  = "0013A20042367EBB"
+	defaultRemoteAddr16Hex  = "FFFE"
+	defaultRemoteAddr64Uint = 0x0013A20042367EBB
+	defaultRemoteAddr16Uint = 0xFFFE
+)
+
+func NewXBeeService(dbPath, missionDir string) (*XBeeService, error) {
 	// Initialize database using existing telemetry package
 	db, err := telemetry.EnsureSchema(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize database: %v", err)
 	}
 
+	if missionDir == "" {
+		missionDir = "missions"
+	}
+	missionDir = filepath.Clean(missionDir)
+
 	service := &XBeeService{
 		serialManager:  NewSerialManager(),
 		frameProcessor: NewFrameProcessor(),
 		database:       db,
 		dbPath:         dbPath,
-		clients:        make(map[*websocket.Conn]bool),
+		missionDir:     missionDir,
+		clients:        make(map[wsClient]struct{}),
 		activityLog:    make([]ActivityItem, 0, 1000),
+		commStore:      newCommunicationStore(10000),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Configure properly for production
@@ -118,6 +151,7 @@ func NewXBeeService(dbPath string) (*XBeeService, error) {
 	// Set up frame processor handlers
 	service.frameProcessor.SetFrameHandler(service.handleIncomingFrame)
 	service.frameProcessor.SetErrorHandler(service.handleFrameError)
+	service.frameProcessor.SetWriter(service.serialManager.Write)
 
 	// Set up serial manager handlers
 	service.serialManager.SetDataHandler(service.frameProcessor.ProcessByte)
@@ -125,6 +159,21 @@ func NewXBeeService(dbPath string) (*XBeeService, error) {
 
 	// Start statistics update goroutine
 	go service.updateStatsLoop()
+
+	// Start auto-reconnect monitoring (enabled by default)
+	service.StartAutoReconnect(true)
+
+	// Attempt initial auto-connect
+	go func() {
+		time.Sleep(2 * time.Second) // Give the service time to fully initialize
+		log.Println("Attempting initial XBee auto-connect...")
+		response := service.AutoConnectXBee()
+		if response.Success {
+			log.Printf("Initial auto-connect successful: %s", response.Message)
+		} else {
+			log.Printf("Initial auto-connect failed: %s (will retry automatically)", response.Error)
+		}
+	}()
 
 	return service, nil
 }
@@ -141,7 +190,7 @@ func (xs *XBeeService) StartNewMission(missionName string) error {
 
 	// Create new mission
 	missionID := fmt.Sprintf("mission_%d", time.Now().Unix())
-	missionDBPath := fmt.Sprintf("missions/%s.db", missionID)
+	missionDBPath := filepath.Join(xs.missionDir, fmt.Sprintf("%s.db", missionID))
 
 	// Create new database for mission using existing telemetry package
 	missionDB, err := telemetry.EnsureSchema(missionDBPath)
@@ -230,6 +279,111 @@ func (xs *XBeeService) OpenPort(portPath string, config SerialConfig) Response {
 	return Response{Success: true}
 }
 
+// AutoDetectXBee attempts to automatically detect an XBee device
+func (xs *XBeeService) AutoDetectXBee() Response {
+	portPath, portInfo, err := xs.serialManager.DetectXBeePort()
+	if err != nil {
+		return Response{
+			Success: false,
+			Error:   fmt.Sprintf("Auto-detection failed: %v", err),
+		}
+	}
+
+	return Response{
+		Success: true,
+		Message: fmt.Sprintf("Detected XBee on %s", portPath),
+		Ports:   []PortInfo{portInfo},
+	}
+}
+
+// AutoConnectXBee automatically detects and connects to an XBee device
+func (xs *XBeeService) AutoConnectXBee() Response {
+	// First detect the XBee
+	portPath, portInfo, err := xs.serialManager.DetectXBeePort()
+	if err != nil {
+		xs.statsMutex.Lock()
+		xs.stats.ConnectionStatus = "disconnected"
+		xs.stats.LastUpdate = time.Now()
+		xs.statsMutex.Unlock()
+
+		return Response{
+			Success: false,
+			Error:   fmt.Sprintf("No XBee device detected: %v", err),
+		}
+	}
+
+	// Use default XBee configuration
+	config := SerialConfig{
+		BaudRate: 115200, // Point-to-point CanSat link
+		DataBits: 8,
+		StopBits: 1,
+		Parity:   "none",
+	}
+
+	// Attempt connection
+	err = xs.serialManager.Open(portPath, config)
+	if err != nil {
+		xs.statsMutex.Lock()
+		xs.stats.ConnectionStatus = "error"
+		xs.stats.LastUpdate = time.Now()
+		xs.statsMutex.Unlock()
+
+		return Response{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to connect to %s: %v", portPath, err),
+		}
+	}
+
+	// Update connection status
+	xs.statsMutex.Lock()
+	xs.stats.ConnectionStatus = "connected"
+	xs.stats.ConnectionUptime = time.Now()
+	xs.stats.LastUpdate = time.Now()
+	xs.statsMutex.Unlock()
+
+	message := fmt.Sprintf("Auto-connected to XBee on %s (%s)", portPath, portInfo.Description)
+	xs.addActivity("CONNECTION", "AUTO_CONNECTED", message)
+	xs.broadcastConnectionStatus(true)
+
+	return Response{
+		Success: true,
+		Message: message,
+		Ports:   []PortInfo{portInfo},
+	}
+}
+
+// StartAutoReconnect starts a background goroutine that monitors the connection
+// and automatically reconnects if the XBee is disconnected
+func (xs *XBeeService) StartAutoReconnect(enabled bool) {
+	if !enabled {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			// Check if we're disconnected
+			xs.statsMutex.RLock()
+			status := xs.stats.ConnectionStatus
+			xs.statsMutex.RUnlock()
+
+			if status != "connected" && !xs.serialManager.IsOpen() {
+				log.Println("XBee disconnected, attempting auto-reconnect...")
+
+				response := xs.AutoConnectXBee()
+				if response.Success {
+					log.Printf("Auto-reconnect successful: %s", response.Message)
+					xs.addActivity("CONNECTION", "AUTO_RECONNECT", response.Message)
+				} else {
+					log.Printf("Auto-reconnect failed: %s", response.Error)
+				}
+			}
+		}
+	}()
+}
+
 func (xs *XBeeService) ClosePort() Response {
 	err := xs.serialManager.Close()
 	if err != nil {
@@ -292,21 +446,31 @@ func (xs *XBeeService) SendCommand(command string, data []byte) error {
 		}
 	}
 
+	// Point-to-point addressing for the CanSat radio link
+	remoteAddr64 := defaultRemoteAddr64Hex
+	remoteAddr16 := defaultRemoteAddr16Hex
+
 	// Send AT command or data packet based on command type
 	var err error
+	var rawData []byte
 	if len(command) == 2 { // AT Command
+		rawData = append([]byte(command), data...)
 		err = xs.frameProcessor.sendATCommand(command, data)
 		xs.updateStats("command_sent", command)
 	} else { // Data packet
 		// For data packets, we might need to specify destination addresses
 		// For now, use broadcast addresses
-		err = xs.frameProcessor.sendDataPacket(append([]byte(command), data...), 0x0000000000000000, 0xFFFE)
+		rawData = append([]byte(command), data...)
+		err = xs.frameProcessor.sendDataPacket(rawData, defaultRemoteAddr64Uint, defaultRemoteAddr16Uint)
 		xs.updateStats("data_sent", command)
 	}
 
 	if err != nil {
 		return err
 	}
+
+	// Log the command with communication log system
+	xs.LogCommand(command, rawData, remoteAddr64, remoteAddr16)
 
 	xs.statsMutex.Lock()
 	xs.stats.LastCommand = command
@@ -323,12 +487,26 @@ func (xs *XBeeService) SendCommand(command string, data []byte) error {
 
 // Frame Handling
 func (xs *XBeeService) handleIncomingFrame(frame XBeeFrameData) error {
+	clusterID, profileID := xs.updateFrameStatistics(frame)
+
+	if frame.PacketType == "TELEMETRY" {
+		xs.processTelemetryFrame(frame)
+	} else {
+		xs.processNonTelemetryFrame(frame, clusterID, profileID)
+	}
+
+	xs.addActivity("FRAME_RECEIVED", frame.Type, fmt.Sprintf("Received %s frame", frame.Type))
+	return nil
+}
+
+func (xs *XBeeService) updateFrameStatistics(frame XBeeFrameData) (uint16, uint16) {
 	xs.statsMutex.Lock()
+	defer xs.statsMutex.Unlock()
+
 	xs.stats.PacketsReceived++
 	xs.stats.LastUpdate = time.Now()
-	xs.stats.LastDataReceived = time.Now() // Track when we last received data
+	xs.stats.LastDataReceived = time.Now()
 
-	// Update frame-specific statistics
 	switch frame.PacketType {
 	case "TELEMETRY":
 		xs.stats.FrameStats.TelemetryCount++
@@ -340,41 +518,69 @@ func (xs *XBeeService) handleIncomingFrame(frame XBeeFrameData) error {
 	default:
 		xs.stats.FrameStats.UnknownCount++
 	}
-	xs.statsMutex.Unlock()
 
-	// Parse and store telemetry data
-	if frame.PacketType == "TELEMETRY" {
-		telemetry, err := xs.parseTelemetryData(frame.Data)
-		if err != nil {
-			log.Printf("Failed to parse telemetry: %v", err)
-			xs.addActivity("ERROR", "PARSE_ERROR", fmt.Sprintf("Failed to parse telemetry: %v", err))
-		} else {
-			// Store in database using GORM directly
-			if err := xs.database.Create(telemetry).Error; err != nil {
-				log.Printf("Failed to store telemetry: %v", err)
-				xs.addActivity("ERROR", "DB_ERROR", fmt.Sprintf("Failed to store telemetry: %v", err))
-			} else {
-				// Broadcast live telemetry
-				xs.broadcastLiveTelemetry(telemetry)
+	if frame.ExplicitMetadata == nil {
+		return 0, 0
+	}
 
-				// Store conversation history for telemetry
-				xs.storeConversation("telemetry", "received", frame.Data, "xbee", fmt.Sprintf(`{"packet_type": "%s"}`, frame.PacketType))
+	return frame.ExplicitMetadata.ClusterId, frame.ExplicitMetadata.ProfileId
+}
+
+func (xs *XBeeService) processTelemetryFrame(frame XBeeFrameData) {
+	telemetry, err := xs.parseTelemetryData(frame.Data)
+	if err != nil {
+		log.Printf("Failed to parse telemetry: %v", err)
+		xs.addActivity("ERROR", "PARSE_ERROR", fmt.Sprintf("Failed to parse telemetry: %v", err))
+		return
+	}
+
+	if err := xs.database.Create(telemetry).Error; err != nil {
+		log.Printf("Failed to store telemetry: %v", err)
+		xs.addActivity("ERROR", "DB_ERROR", fmt.Sprintf("Failed to store telemetry: %v", err))
+		return
+	}
+
+	xs.broadcastLiveTelemetry(telemetry)
+	xs.storeConversation("telemetry", "received", frame.Data, "xbee", marshalMetadata(map[string]interface{}{
+		"packet_type": frame.PacketType,
+		"frame_type":  frame.Type,
+	}))
+}
+
+func (xs *XBeeService) processNonTelemetryFrame(frame XBeeFrameData, clusterID, profileID uint16) {
+	responseType := frame.PacketType
+	if responseType == "" {
+		responseType = frame.Type
+	}
+
+	parsedData := frame.Data
+	metadata := map[string]interface{}{
+		"packet_type": frame.PacketType,
+		"frame_type":  frame.Type,
+	}
+
+	if frame.PacketType == "LOG" {
+		if payload, ok := parseLogPayload(frame.Data); ok {
+			if dataBytes, err := json.Marshal(payload); err == nil {
+				parsedData = string(dataBytes)
 			}
+			metadata["log"] = payload
 		}
 	}
 
-	xs.addActivity("FRAME_RECEIVED", frame.Type, fmt.Sprintf("Received %s frame", frame.Type))
+	xs.LogResponse(responseType, []byte(frame.Data), parsedData, frame.Remote64, frame.Remote16, clusterID, profileID)
 
-	// Store conversation history for non-telemetry frames
-	if frame.PacketType != "TELEMETRY" {
-		messageType := "response"
-		if frame.PacketType == "LOG" {
-			messageType = "log"
-		}
-		xs.storeConversation(messageType, "received", frame.Data, "xbee", fmt.Sprintf(`{"packet_type": "%s", "frame_type": "%s"}`, frame.PacketType, frame.Type))
+	messageType := "response"
+	if frame.PacketType == "LOG" {
+		messageType = "log"
 	}
 
-	return nil
+	displayData := parsedData
+	if displayData == "" {
+		displayData = frame.Data
+	}
+
+	xs.storeConversation(messageType, "received", displayData, "xbee", marshalMetadata(metadata))
 }
 
 func (xs *XBeeService) handleFrameError(err error) {
@@ -405,57 +611,127 @@ func (xs *XBeeService) handleDisconnection() {
 	xs.broadcastConnectionStatus(false)
 }
 
+const telemetryFieldCount = 41
+
 // Telemetry Parsing (CSV format expected)
 func (xs *XBeeService) parseTelemetryData(data string) (*models.Telemetry, error) {
-	// Expected CSV format: TEAM_ID,mission_time_s,packet_count,altitude,pressure,temperature,voltage,gnss_time,latitude,longitude,gps_altitude,satellites,accel_x,accel_y,accel_z,gyro_spin_rate,flight_state,gyro_x,gyro_y,gyro_z,roll,pitch,yaw,mag_x,mag_y,mag_z,humidity,current,power,baro_altitude,air_quality_raw,aq_ethanol_ppm,mcu_temp_c,rssi_dbm,health_flags,rtc_epoch,cmd_echo
-
-	// Simple CSV parsing (you might want to use a proper CSV library)
 	fields := parseCSV(data)
-	if len(fields) < 10 { // Minimum required fields
+	if len(fields) < telemetryFieldCount {
 		return nil, fmt.Errorf("insufficient telemetry fields: got %d", len(fields))
+	}
+
+	trim := func(idx int) string {
+		if idx >= len(fields) {
+			return ""
+		}
+		return strings.TrimSpace(fields[idx])
+	}
+
+	parseFloat := func(idx int) *float64 {
+		value := trim(idx)
+		if value == "" {
+			return nil
+		}
+		if v, err := strconv.ParseFloat(value, 64); err == nil {
+			return &v
+		}
+		return nil
+	}
+
+	parseInt := func(idx int) *int {
+		value := trim(idx)
+		if value == "" {
+			return nil
+		}
+		if v, err := strconv.Atoi(value); err == nil {
+			return &v
+		}
+		return nil
+	}
+
+	parseInt64 := func(idx int) *int64 {
+		value := trim(idx)
+		if value == "" {
+			return nil
+		}
+		if v, err := strconv.ParseInt(value, 10, 64); err == nil {
+			return &v
+		}
+		return nil
 	}
 
 	telemetry := &models.Telemetry{}
 
-	// Parse each field with error handling
-	if len(fields) > 0 && fields[0] != "" {
-		teamID := fields[0]
-		telemetry.TeamID = &teamID
+	if val := trim(0); val != "" {
+		telemetry.TeamID = &val
 	}
 
-	if len(fields) > 1 && fields[1] != "" {
-		if val, err := strconv.ParseFloat(fields[1], 64); err == nil {
-			telemetry.MissionTimeS = &val
+	telemetry.MissionTimeS = parseFloat(1)
+	telemetry.PacketCount = parseInt(2)
+	telemetry.Altitude = parseFloat(3)
+	telemetry.Pressure = parseFloat(4)
+	telemetry.Temperature = parseFloat(5)
+	telemetry.Voltage = parseFloat(6)
+
+	if val := trim(7); val != "" {
+		telemetry.GnssTime = &val
+	}
+
+	telemetry.Latitude = parseFloat(8)
+	telemetry.Longitude = parseFloat(9)
+	telemetry.GpsAltitude = parseFloat(10)
+	telemetry.Satellites = parseInt(11)
+
+	offset := 0
+	if len(fields) >= 44 {
+		telemetry.IrnssInView = parseInt(12)
+		telemetry.IrnssUsed = parseInt(13)
+		telemetry.IrnssMask = parseInt64(14)
+		offset = 3
+	}
+
+	telemetry.AccelX = parseFloat(12 + offset)
+	telemetry.AccelY = parseFloat(13 + offset)
+	telemetry.AccelZ = parseFloat(14 + offset)
+	telemetry.GyroSpinRate = parseFloat(15 + offset)
+	telemetry.FlightState = parseInt(16 + offset)
+	telemetry.GyroX = parseFloat(17 + offset)
+	telemetry.GyroY = parseFloat(18 + offset)
+	telemetry.GyroZ = parseFloat(19 + offset)
+	telemetry.Roll = parseFloat(20 + offset)
+	telemetry.Pitch = parseFloat(21 + offset)
+	telemetry.Yaw = parseFloat(22 + offset)
+	telemetry.MagX = parseFloat(23 + offset)
+	telemetry.MagY = parseFloat(24 + offset)
+	telemetry.MagZ = parseFloat(25 + offset)
+	telemetry.Humidity = parseFloat(26 + offset)
+	telemetry.Current = parseFloat(27 + offset)
+	telemetry.Power = parseFloat(28 + offset)
+	telemetry.BaroAltitude = parseFloat(29 + offset)
+	telemetry.AirQualityRaw = parseInt(30 + offset)
+	telemetry.AqEthanolPpm = parseFloat(31 + offset)
+	telemetry.McuTempC = parseFloat(32 + offset)
+	telemetry.RssiDbm = parseInt(33 + offset)
+
+	if val := trim(34 + offset); val != "" {
+		telemetry.HealthFlags = &val
+	}
+
+	if rtc := trim(35 + offset); rtc != "" {
+		if parsed, err := strconv.ParseInt(rtc, 10, 64); err == nil {
+			v := int(parsed)
+			telemetry.RtcEpoch = &v
 		}
 	}
 
-	if len(fields) > 2 && fields[2] != "" {
-		if val, err := strconv.Atoi(fields[2]); err == nil {
-			telemetry.PacketCount = &val
-		}
-	}
+	telemetry.RwSpeedPct = parseInt(36 + offset)
+	telemetry.RwSaturated = parseInt(37 + offset)
+	telemetry.YawRateTarget = parseFloat(38 + offset)
+	telemetry.PidOutput = parseFloat(39 + offset)
 
-	if len(fields) > 3 && fields[3] != "" {
-		if val, err := strconv.ParseFloat(fields[3], 64); err == nil {
-			telemetry.Altitude = &val
-		}
+	if val := trim(40 + offset); val != "" {
+		telemetry.CmdEcho = &val
 	}
-
-	if len(fields) > 4 && fields[4] != "" {
-		if val, err := strconv.ParseFloat(fields[4], 64); err == nil {
-			telemetry.Pressure = &val
-		}
-	}
-
-	if len(fields) > 5 && fields[5] != "" {
-		if val, err := strconv.ParseFloat(fields[5], 64); err == nil {
-			telemetry.Temperature = &val
-		}
-	}
-
-	// Add timestamp
-	rtcEpoch := int(time.Now().Unix())
-	telemetry.RtcEpoch = &rtcEpoch
 
 	return telemetry, nil
 }
@@ -634,14 +910,19 @@ func (xs *XBeeService) broadcastConnectionStatus(connected bool) {
 
 func (xs *XBeeService) broadcastToClients(data LiveTelemetryData) {
 	xs.clientsMutex.RLock()
-	defer xs.clientsMutex.RUnlock()
-
+	clients := make([]wsClient, 0, len(xs.clients))
 	for client := range xs.clients {
-		err := client.WriteJSON(data)
-		if err != nil {
+		clients = append(clients, client)
+	}
+	xs.clientsMutex.RUnlock()
+
+	for _, client := range clients {
+		if err := client.WriteJSON(data); err != nil {
 			log.Printf("Error broadcasting to client: %v", err)
 			client.Close()
+			xs.clientsMutex.Lock()
 			delete(xs.clients, client)
+			xs.clientsMutex.Unlock()
 		}
 	}
 }
@@ -653,10 +934,23 @@ func (xs *XBeeService) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Printf("WebSocket upgrade error: %v", err)
 		return
 	}
+
+	xs.serveWebSocketConnection(conn)
+}
+
+func (xs *XBeeService) ServeWebSocketConn(conn wsClient) {
+	if conn == nil {
+		return
+	}
+
+	xs.serveWebSocketConnection(conn)
+}
+
+func (xs *XBeeService) serveWebSocketConnection(conn wsClient) {
 	defer conn.Close()
 
 	xs.clientsMutex.Lock()
-	xs.clients[conn] = true
+	xs.clients[conn] = struct{}{}
 	xs.clientsMutex.Unlock()
 
 	defer func() {
@@ -860,6 +1154,40 @@ func (xs *XBeeService) GetConversationHistoryCount(missionID string) (int64, err
 }
 
 // Utility Functions
+func parseLogPayload(data string) (logPayload, bool) {
+	payload := logPayload{Raw: data}
+
+	trimmed := strings.TrimSpace(data)
+	if len(trimmed) < 2 || trimmed[0] != '[' || trimmed[len(trimmed)-1] != ']' {
+		return payload, false
+	}
+
+	inner := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+	if inner == "" {
+		return payload, false
+	}
+
+	parts := strings.Fields(inner)
+	if len(parts) < 2 {
+		return payload, false
+	}
+
+	payload.Timestamp = parts[0]
+	payload.EncodedCommand = strings.Join(parts[1:], " ")
+	return payload, true
+}
+
+func marshalMetadata(meta map[string]interface{}) string {
+	if meta == nil {
+		return "{}"
+	}
+	data, err := json.Marshal(meta)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
 func parseCSV(data string) []string {
 	// Simple CSV parsing - you might want to use encoding/csv for production
 	fields := make([]string, 0)
@@ -882,9 +1210,53 @@ func parseCSV(data string) []string {
 		}
 	}
 
-	if current != "" {
-		fields = append(fields, current)
-	}
+	fields = append(fields, current)
 
 	return fields
+}
+
+// Communication Log Methods
+
+// LogCommand records a command sent to the XBee/CanSat
+func (xs *XBeeService) LogCommand(command string, rawData []byte, remoteAddr64, remoteAddr16 string) CommandLog {
+	missionID := xs.currentMissionID()
+	entry := xs.commStore.recordCommand(command, missionID, rawData, remoteAddr64, remoteAddr16)
+
+	log.Printf("Logged command: %s", command)
+	return entry
+}
+
+// LogResponse records a response received from XBee/CanSat
+func (xs *XBeeService) LogResponse(responseType string, rawData []byte, parsedData string, remoteAddr64, remoteAddr16 string, clusterID, profileID uint16) ResponseLog {
+	missionID := xs.currentMissionID()
+	entry := xs.commStore.recordResponse(responseType, missionID, rawData, parsedData, remoteAddr64, remoteAddr16, clusterID, profileID)
+
+	log.Printf("Logged response: %s (Cluster: 0x%04X)", responseType, clusterID)
+	return entry
+}
+
+func (xs *XBeeService) currentMissionID() string {
+	xs.missionMutex.RLock()
+	defer xs.missionMutex.RUnlock()
+
+	if xs.currentMission != nil && xs.currentMission.IsActive {
+		return xs.currentMission.ID
+	}
+
+	return ""
+}
+
+// GetCommunicationLogs returns a snapshot of all communication logs.
+func (xs *XBeeService) GetCommunicationLogs() CommunicationSnapshot {
+	return xs.commStore.snapshot()
+}
+
+// GetCommandLogs returns only the command history.
+func (xs *XBeeService) GetCommandLogs() []CommandLog {
+	return xs.commStore.latestCommands()
+}
+
+// GetResponseLogs returns only the response history.
+func (xs *XBeeService) GetResponseLogs() []ResponseLog {
+	return xs.commStore.latestResponses()
 }

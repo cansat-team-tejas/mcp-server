@@ -9,10 +9,12 @@ import (
 type FrameProcessor struct {
 	frameHandler func(XBeeFrameData) error
 	errorHandler func(error)
+	writer       func([]byte) (int, error)
 	frameIdCount byte
 	buffer       []byte
 	state        int // 0 = waiting for delimiter, 1 = reading length, 2 = reading frame
 	expectedLen  int
+	escapeNext   bool
 }
 
 const (
@@ -20,6 +22,10 @@ const (
 	STATE_DELIMITER = 0
 	STATE_LENGTH    = 1
 	STATE_FRAME     = 2
+
+	packetTypeTelemetry   = 0x0001
+	packetTypeLog         = 0x0002
+	packetTypeCmdResponse = 0x0003
 )
 
 func NewFrameProcessor() *FrameProcessor {
@@ -39,6 +45,11 @@ func (fp *FrameProcessor) SetErrorHandler(handler func(error)) {
 	fp.errorHandler = handler
 }
 
+// SetWriter injects a transport layer used when transmitting frames out over serial.
+func (fp *FrameProcessor) SetWriter(writer func([]byte) (int, error)) {
+	fp.writer = writer
+}
+
 // Process incoming bytes with basic XBee frame parsing
 func (fp *FrameProcessor) ProcessByte(data []byte) error {
 	if len(data) == 0 {
@@ -51,6 +62,7 @@ func (fp *FrameProcessor) ProcessByte(data []byte) error {
 			if b == FRAME_DELIMITER {
 				fp.buffer = fp.buffer[:0] // Clear buffer
 				fp.state = STATE_LENGTH
+				fp.escapeNext = false
 			}
 
 		case STATE_LENGTH:
@@ -66,11 +78,21 @@ func (fp *FrameProcessor) ProcessByte(data []byte) error {
 			}
 
 		case STATE_FRAME:
-			fp.buffer = append(fp.buffer, b)
+			if fp.escapeNext {
+				fp.buffer = append(fp.buffer, b^0x20)
+				fp.escapeNext = false
+			} else if b == 0x7D {
+				fp.escapeNext = true
+				continue
+			} else {
+				fp.buffer = append(fp.buffer, b)
+			}
+
 			if len(fp.buffer) >= fp.expectedLen+1 { // +1 for checksum
 				// Process complete frame
 				fp.processFrame(fp.buffer[:fp.expectedLen])
 				fp.state = STATE_DELIMITER
+				fp.escapeNext = false
 			}
 		}
 	}
@@ -139,11 +161,11 @@ func (fp *FrameProcessor) processFrame(frameData []byte) {
 
 			// Map cluster IDs to packet types
 			switch frame.ExplicitMetadata.ClusterId {
-			case 0x0001:
+			case packetTypeTelemetry:
 				frame.PacketType = "TELEMETRY"
-			case 0x0002:
+			case packetTypeLog:
 				frame.PacketType = "LOG"
-			case 0x0003:
+			case packetTypeCmdResponse:
 				frame.PacketType = "CMD_RESPONSE"
 			default:
 				frame.PacketType = "UNKNOWN"
@@ -244,11 +266,39 @@ func (fp *FrameProcessor) sendRawFrame(frameData []byte) error {
 	packet = append(packet, frameData...)                  // Frame data
 	packet = append(packet, checksum)                      // Checksum
 
-	// This would normally be sent via serial port
-	// For now, just log it
-	log.Printf("Sending XBee frame: %X", packet)
+	escaped := fp.escapeFrame(packet)
 
-	return nil
+	log.Printf("Sending XBee frame: %X", escaped)
+
+	if fp.writer != nil {
+		if _, err := fp.writer(escaped); err != nil {
+			fp.handleError(fmt.Errorf("failed to write XBee frame: %w", err))
+			return err
+		}
+		return nil
+	}
+
+	return fmt.Errorf("no XBee writer configured")
+}
+
+func (fp *FrameProcessor) escapeFrame(packet []byte) []byte {
+	if len(packet) == 0 {
+		return packet
+	}
+
+	escaped := []byte{packet[0]}
+
+	for i := 1; i < len(packet); i++ {
+		b := packet[i]
+		switch b {
+		case 0x7E, 0x7D, 0x11, 0x13:
+			escaped = append(escaped, 0x7D, b^0x20)
+		default:
+			escaped = append(escaped, b)
+		}
+	}
+
+	return escaped
 }
 
 func (fp *FrameProcessor) handleError(err error) {

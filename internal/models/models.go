@@ -19,6 +19,9 @@ type Telemetry struct {
 	Longitude     *float64
 	GpsAltitude   *float64 `gorm:"column:gps_altitude"`
 	Satellites    *int
+	IrnssInView   *int     `gorm:"column:irnss_in_view"`
+	IrnssUsed     *int     `gorm:"column:irnss_used"`
+	IrnssMask     *int64   `gorm:"column:irnss_mask"`
 	AccelX        *float64 `gorm:"column:accel_x"`
 	AccelY        *float64 `gorm:"column:accel_y"`
 	AccelZ        *float64 `gorm:"column:accel_z"`
@@ -44,6 +47,14 @@ type Telemetry struct {
 	HealthFlags   *string  `gorm:"column:health_flags"`
 	RtcEpoch      *int     `gorm:"column:rtc_epoch"`
 	CmdEcho       *string  `gorm:"column:cmd_echo"`
+	RwSpeedPct    *int     `gorm:"column:rw_speed_pct"`
+	RwSaturated   *int     `gorm:"column:rw_saturated"`
+	YawRateTarget *float64 `gorm:"column:yaw_rate_target"`
+	PidOutput     *float64 `gorm:"column:pid_output"`
+}
+
+func (Telemetry) TableName() string {
+	return "telemetry"
 }
 
 // ConversationHistory represents a communication message for a specific mission.

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
@@ -27,13 +28,13 @@ type XBeeConfig struct {
 
 const (
 	defaultPort        = 8000
-	defaultDBPath      = "telemetry.db"
 	defaultSchemaPath  = "db_schema.sql"
 	defaultLLMEndpoint = "http://localhost:11434"
 	defaultLLMModel    = "llama3.1:8b"
+	defaultDBFileName  = "telemetry.db"
 
 	// XBee defaults
-	defaultXBeeBaudRate = 9600
+	defaultXBeeBaudRate = 115200
 	defaultXBeeDataBits = 8
 	defaultXBeeStopBits = 1
 	defaultXBeeParity   = "none"
@@ -41,6 +42,21 @@ const (
 )
 
 func Load() Config {
+	missionDir := os.Getenv("MISSION_DIR")
+	if missionDir == "" {
+		missionDir = defaultMissionDir
+	}
+	missionDir = filepath.Clean(missionDir)
+	if absMission, err := filepath.Abs(missionDir); err == nil {
+		missionDir = absMission
+	}
+	if err := os.MkdirAll(missionDir, 0o755); err != nil {
+		missionDir = defaultMissionDir
+		_ = os.MkdirAll(missionDir, 0o755)
+	}
+
+	defaultDBPath := filepath.Join(missionDir, defaultDBFileName)
+
 	port := defaultPort
 	if val := os.Getenv("PORT"); val != "" {
 		if parsed, err := strconv.Atoi(val); err == nil {
@@ -55,6 +71,15 @@ func Load() Config {
 		} else {
 			dbPath = defaultDBPath
 		}
+	}
+
+	if absPath, err := filepath.Abs(dbPath); err == nil {
+		dbPath = absPath
+	}
+
+	missionPrefix := missionDir + string(os.PathSeparator)
+	if !strings.HasPrefix(dbPath, missionPrefix) && dbPath != filepath.Join(missionDir, filepath.Base(dbPath)) {
+		dbPath = defaultDBPath
 	}
 
 	schemaPath := os.Getenv("DB_SCHEMA_PATH")
@@ -98,11 +123,6 @@ func Load() Config {
 	xbeeParity := os.Getenv("XBEE_PARITY")
 	if xbeeParity == "" {
 		xbeeParity = defaultXBeeParity
-	}
-
-	missionDir := os.Getenv("MISSION_DIR")
-	if missionDir == "" {
-		missionDir = defaultMissionDir
 	}
 
 	return Config{
