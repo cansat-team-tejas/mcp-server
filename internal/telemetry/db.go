@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"goapp/internal/database"
 )
 
 func EnsureSchema(ctx context.Context, db *sql.DB, schemaPath string) error {
@@ -18,6 +20,15 @@ func EnsureSchema(ctx context.Context, db *sql.DB, schemaPath string) error {
 		return nil
 	}
 
+	// If schemaPath is empty, use the embedded schema from database package
+	if schemaPath == "" {
+		if _, err := db.ExecContext(ctx, database.TableSchema); err != nil {
+			return fmt.Errorf("apply embedded schema: %w", err)
+		}
+		return nil
+	}
+
+	// Otherwise, read from file
 	schemaBytes, err := readSchema(schemaPath)
 	if err != nil {
 		return err
@@ -109,4 +120,15 @@ func Query(ctx context.Context, db *sql.DB, sql string) ([]map[string]any, error
 	}
 
 	return results, nil
+}
+
+// HasData returns true if the telemetry table contains at least one row
+func HasData(ctx context.Context, db *sql.DB) (bool, error) {
+	var exists int
+	// Using EXISTS is efficient for presence checks
+	err := db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM telemetry LIMIT 1)").Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists == 1, nil
 }

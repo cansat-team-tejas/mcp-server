@@ -3,7 +3,6 @@ package config
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 )
 
@@ -16,7 +15,6 @@ type Config struct {
 
 const (
 	defaultPort       = 8000
-	defaultDBPath     = "telemetry.db"
 	defaultSchemaPath = "db_schema.sql"
 )
 
@@ -28,14 +26,8 @@ func Load() Config {
 		}
 	}
 
+	// DB_PATH is optional. If not provided, the app starts without an active database.
 	dbPath := os.Getenv("DB_PATH")
-	if dbPath == "" {
-		if resolved, ok := resolvePath(defaultDBPath); ok {
-			dbPath = resolved
-		} else {
-			dbPath = defaultDBPath
-		}
-	}
 
 	schemaPath := os.Getenv("DB_SCHEMA_PATH")
 	if schemaPath == "" {
@@ -43,9 +35,6 @@ func Load() Config {
 	}
 
 	token := os.Getenv("HUGGING_FACE_TOKEN")
-	if token == "" {
-		token = "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"
-	}
 
 	return Config{
 		Port:             port,
@@ -59,19 +48,4 @@ func (c Config) ListenAddress() string {
 	return fmt.Sprintf(":%d", c.Port)
 }
 
-func resolvePath(relative string) (string, bool) {
-	candidates := []string{relative}
-	if !filepath.IsAbs(relative) {
-		candidates = append(candidates,
-			filepath.Join("..", relative),
-			filepath.Join("..", "server", relative),
-		)
-	}
-
-	for _, candidate := range candidates {
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate, true
-		}
-	}
-	return "", false
-}
+// no resolvePath needed when DB_PATH is optional

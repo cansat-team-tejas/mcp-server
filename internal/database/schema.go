@@ -1,3 +1,8 @@
+package database
+
+// TableSchema defines the structure of the telemetry table
+// Modify this structure if you need to change the database schema in the future
+const TableSchema = `
 CREATE TABLE IF NOT EXISTS telemetry (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     TEAM_ID TEXT,
@@ -39,3 +44,18 @@ CREATE TABLE IF NOT EXISTS telemetry (
     cmd_echo TEXT,
     log_data TEXT
 );
+`
+
+// ColumnNames returns all column names for the telemetry table (excluding id)
+func ColumnNames() []string {
+	return []string{
+		"TEAM_ID", "mission_time_s", "packet_count", "altitude", "pressure",
+		"temperature", "voltage", "gnss_time", "latitude", "longitude",
+		"gps_altitude", "satellites", "accel_x", "accel_y", "accel_z",
+		"gyro_spin_rate", "flight_state", "gyro_x", "gyro_y", "gyro_z",
+		"roll", "pitch", "yaw", "mag_x", "mag_y", "mag_z",
+		"humidity", "current", "power", "baro_altitude", "air_quality_raw",
+		"aq_ethanol_ppm", "mcu_temp_c", "rssi_dbm", "health_flags",
+		"rtc_epoch", "cmd_echo", "log_data",
+	}
+}

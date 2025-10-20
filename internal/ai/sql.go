@@ -25,7 +25,7 @@ func (c *Client) GenerateSQL(ctx context.Context, question string) (string, erro
 		"gyro_x, gyro_y, gyro_z, roll, pitch, yaw, " +
 		"mag_x, mag_y, mag_z, humidity, " +
 		"current, power, baro_altitude, " +
-		"air_quality_raw, aq_ethanol_ppm, mcu_temp_c, rssi_dbm, health_flags, rtc_epoch, cmd_echo"
+		"air_quality_raw, aq_ethanol_ppm, mcu_temp_c, rssi_dbm, health_flags, rtc_epoch, cmd_echo, log_data"
 
 	userPrompt := "Schema columns: " + schema + "\nQuestion: " + question + "\nRespond with a single SQLite SELECT statement."
 

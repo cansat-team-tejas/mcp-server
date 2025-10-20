@@ -19,6 +19,7 @@ type Answer struct {
 }
 
 func AnswerQuestion(ctx context.Context, question string, db *sql.DB, client *ai.Client) (Answer, error) {
+	// Always process command requests first, even without a DB
 	commandEntries := commands.DetectCommandRequest(question)
 	if len(commandEntries) > 0 {
 		codes := make([]string, 0, len(commandEntries))
@@ -33,6 +34,17 @@ func AnswerQuestion(ctx context.Context, question string, db *sql.DB, client *ai
 		}, nil
 	}
 
+	// If no DB is connected, try to answer as a basic question without telemetry context
+	if db == nil {
+		return answerBasicQuestion(ctx, question, client)
+	}
+
+	// If DB has no telemetry rows, try basic question handling
+	if has, err := telemetry.HasData(ctx, db); err == nil && !has {
+		return answerBasicQuestion(ctx, question, client)
+	}
+
+	// DB exists with data: attempt SQL generation and telemetry-based answer
 	rawSQL, err := client.GenerateSQL(ctx, question)
 	if err != nil {
 		return Answer{}, fmt.Errorf("generate sql: %w", err)
@@ -48,12 +60,13 @@ func AnswerQuestion(ctx context.Context, question string, db *sql.DB, client *ai
 		return Answer{}, fmt.Errorf("run query: %w", err)
 	}
 
-	contextSections := make([]string, 0, 2)
-	if len(rows) > 0 {
-		contextSections = append(contextSections, telemetry.FormatResultsForPrompt(question, rows))
-	} else {
-		contextSections = append(contextSections, "No rows were returned for this query.")
+	// If no data exists, return a clear message immediately
+	if len(rows) == 0 {
+		return Answer{Content: "No telemetry data found in the database. Please push some data first or create a new database with telemetry records."}, nil
 	}
+
+	contextSections := make([]string, 0, 2)
+	contextSections = append(contextSections, telemetry.FormatResultsForPrompt(question, rows))
 
 	if len(meta) > 0 {
 		metaPairs := make([]string, 0, len(meta))
@@ -75,7 +88,8 @@ func AnswerQuestion(ctx context.Context, question string, db *sql.DB, client *ai
 
 	contextText := strings.Join(contextSections, "\n")
 
-	systemInstruction := "You are an engaging telemetry data assistant. Use the provided context to craft a friendly, insight-rich reply, reference concrete numbers, and explain what they mean. Present the answer in short paragraphs or bullet lists."
+	// Use the AI context from the context package
+	systemInstruction := ai.GetSystemPrompt()
 	userMessage := fmt.Sprintf("User question: %s\nSQL executed: %s\nContext:\n%s\nRespond conversationally while staying grounded in the data.", question, sql, contextText)
 
 	message := []ai.Message{
@@ -84,6 +98,25 @@ func AnswerQuestion(ctx context.Context, question string, db *sql.DB, client *ai
 	}
 
 	response, err := client.Chat(ctx, message)
+	if err != nil {
+		return Answer{}, fmt.Errorf("llm response: %w", err)
+	}
+
+	return Answer{Content: response}, nil
+}
+
+// answerBasicQuestion handles general questions without telemetry data
+func answerBasicQuestion(ctx context.Context, question string, client *ai.Client) (Answer, error) {
+	systemPrompt := ai.GetSystemPrompt() + "\n\nNote: No telemetry database is currently active. Answer the user's question in a general conversational manner. If the question requires specific telemetry data, politely explain that a database must be created and populated first."
+
+	userMessage := fmt.Sprintf("User question: %s\n\nPlease answer conversationally. If this question requires telemetry data to answer, explain that no database is currently connected.", question)
+
+	messages := []ai.Message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: userMessage},
+	}
+
+	response, err := client.Chat(ctx, messages)
 	if err != nil {
 		return Answer{}, fmt.Errorf("llm response: %w", err)
 	}
