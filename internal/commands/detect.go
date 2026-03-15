@@ -73,10 +73,4 @@ func contains(tokens []string, keyword string) bool {
 	return false
 }
 
-func FormatCommandResponse(entry CommandEntry) string {
-	extra := ""
-	if strings.HasSuffix(entry.Code, ":") {
-		extra = " Provide the required argument directly after the colon."
-	}
-	return "Use the `" + entry.Label + "` command (`" + entry.Code + "`) to " + entry.Description + extra
-}
+

@@ -1,7 +1,8 @@
 package api
 
 type AskRequest struct {
-	Question string `json:"question"`
+	Question   string         `json:"question"`
+	CurrentRow map[string]any `json:"current_row,omitempty"`
 }
 
 type QueryRequest struct {

@@ -8,14 +8,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
+	"net/url"
+	"strings"
 	"time"
 )
 
 const (
-	// Ollama defaults
-	defaultOllamaHost  = "http://localhost:11434"
-	defaultOllamaModel = "gemma3:4b"
+	defaultGeminiEndpoint = "https://generativelanguage.googleapis.com/v1beta"
 )
 
 type Message struct {
@@ -23,44 +22,44 @@ type Message struct {
 	Content string `json:"content"`
 }
 
-type ChatRequest struct {
-	// Ollama chat API expects: { model, messages: [{role, content}, ...], stream }
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Stream   bool      `json:"stream"`
+type geminiPart struct {
+	Text string `json:"text"`
 }
 
-// Minimal struct to parse Ollama's non-streaming response
-// https://github.com/ollama/ollama/blob/main/docs/api.md#generate-a-chat-completion
-type chatResponse struct {
-	Model         string  `json:"model"`
-	CreatedAt     string  `json:"created_at"`
-	Message       Message `json:"message"`
-	Done          bool    `json:"done"`
-	TotalDuration int64   `json:"total_duration"`
-	EvalCount     int     `json:"eval_count"`
-	Error         string  `json:"error"`
+type geminiContent struct {
+	Role  string       `json:"role,omitempty"`
+	Parts []geminiPart `json:"parts"`
+}
+
+type geminiRequest struct {
+	SystemInstruction *geminiContent         `json:"systemInstruction,omitempty"`
+	Contents          []geminiContent        `json:"contents"`
+	GenerationConfig  map[string]interface{} `json:"generationConfig,omitempty"`
+}
+
+type geminiResponse struct {
+	Candidates []struct {
+		Content struct {
+			Parts []geminiPart `json:"parts"`
+		} `json:"content"`
+	} `json:"candidates"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
 }
 
 type Client struct {
 	httpClient *http.Client
-	host       string
+	endpoint   string
+	apiKey     string
 	model      string
 }
 
-func NewClient(token string) *Client {
-	// Allow overrides via env vars for flexibility
-	host := os.Getenv("OLLAMA_HOST")
-	if host == "" {
-		host = defaultOllamaHost
-	}
-	model := os.Getenv("OLLAMA_MODEL")
-	if model == "" {
-		model = defaultOllamaModel
-	}
+func NewClient(apiKey, model string) *Client {
 	return &Client{
 		httpClient: &http.Client{Timeout: 120 * time.Second},
-		host:       host,
+		endpoint:   defaultGeminiEndpoint,
+		apiKey:     apiKey,
 		model:      model,
 	}
 }
@@ -69,11 +68,46 @@ func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
 	if c == nil {
 		return "", errors.New("ai client is nil")
 	}
+	if strings.TrimSpace(c.apiKey) == "" {
+		return "", errors.New("gemini api key is not configured")
+	}
 
-	payload := ChatRequest{
-		Model:    c.model,
-		Messages: messages,
-		Stream:   false,
+	var systemParts []string
+	contents := make([]geminiContent, 0, len(messages))
+	for _, message := range messages {
+		if strings.TrimSpace(message.Content) == "" {
+			continue
+		}
+		if message.Role == "system" {
+			systemParts = append(systemParts, message.Content)
+			continue
+		}
+		role := "user"
+		if message.Role == "assistant" {
+			role = "model"
+		}
+		contents = append(contents, geminiContent{
+			Role:  role,
+			Parts: []geminiPart{{Text: message.Content}},
+		})
+	}
+	if len(contents) == 0 {
+		return "", errors.New("no content provided to gemini")
+	}
+
+	payload := geminiRequest{
+		Contents: contents,
+		GenerationConfig: map[string]interface{}{
+			"temperature":     0.2,
+			"topP":            0.8,
+			"candidateCount":  1,
+			"maxOutputTokens": 1024,
+		},
+	}
+	if len(systemParts) > 0 {
+		payload.SystemInstruction = &geminiContent{
+			Parts: []geminiPart{{Text: strings.Join(systemParts, "\n\n")}},
+		}
 	}
 
 	buf := new(bytes.Buffer)
@@ -81,9 +115,8 @@ func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
 		return "", fmt.Errorf("encode request: %w", err)
 	}
 
-	// POST {host}/api/chat
-	url := c.host + "/api/chat"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, buf)
+	requestURL := fmt.Sprintf("%s/models/%s:generateContent?key=%s", c.endpoint, url.PathEscape(c.model), url.QueryEscape(c.apiKey))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, buf)
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}
@@ -101,17 +134,30 @@ func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
 	}
 
 	if resp.StatusCode >= 300 {
-		return "", fmt.Errorf("ollama error: %s", string(body))
+		return "", fmt.Errorf("gemini api error: %s", string(body))
 	}
 
-	var parsed chatResponse
+	var parsed geminiResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return "", fmt.Errorf("parse response: %w", err)
 	}
 
-	if parsed.Error != "" {
-		return "", fmt.Errorf("ollama error: %s", parsed.Error)
+	if parsed.Error != nil {
+		return "", fmt.Errorf("gemini api error: %s", parsed.Error.Message)
+	}
+	if len(parsed.Candidates) == 0 || len(parsed.Candidates[0].Content.Parts) == 0 {
+		return "", errors.New("gemini returned no candidates")
 	}
 
-	return parsed.Message.Content, nil
+	parts := make([]string, 0, len(parsed.Candidates[0].Content.Parts))
+	for _, part := range parsed.Candidates[0].Content.Parts {
+		if strings.TrimSpace(part.Text) != "" {
+			parts = append(parts, part.Text)
+		}
+	}
+	if len(parts) == 0 {
+		return "", errors.New("gemini returned empty content")
+	}
+
+	return strings.Join(parts, "\n"), nil
 }
