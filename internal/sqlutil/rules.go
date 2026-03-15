@@ -152,6 +152,13 @@ func EnforceOrderClause(sql string, asc bool, limit int) string {
 		}
 	}
 
+	// Only enforce ORDER BY and LIMIT if it's a simple SELECT FROM telemetry
+	// and doesn't already have complex clauses that our naive regex might break.
+	lowerSQL := strings.ToLower(sanitized)
+	if !strings.Contains(lowerSQL, "from telemetry") {
+		return sql
+	}
+
 	clause := "ORDER BY rtc_epoch "
 	if asc {
 		clause += "ASC"
@@ -164,9 +171,6 @@ func EnforceOrderClause(sql string, asc bool, limit int) string {
 	sanitized = strings.TrimSpace(sanitized)
 	if sanitized == "" {
 		return clause
-	}
-	if strings.HasSuffix(sanitized, ")") {
-		return sanitized + " " + clause
 	}
 	return sanitized + " " + clause
 }
