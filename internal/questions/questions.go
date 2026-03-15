@@ -95,14 +95,8 @@ func AnswerQuestion(ctx context.Context, question string, db *gorm.DB, client *a
 	}
 
 
-	if shouldForceCurrentSnapshot(question, currentRow) || currentSnapshotIntent.MatchString(question) {
-
-		ans, err := answerWithCurrentRowOnly(ctx, question, client, currentRow, commandContext)
-		if err == nil {
-			ans.Commands = commandCodes
-		}
-		return ans, err
-	}
+	// We no longer force snapshot mode here to allow the AI to be more conversational 
+	// and use historical data even for "status" style questions.
 
 
 
