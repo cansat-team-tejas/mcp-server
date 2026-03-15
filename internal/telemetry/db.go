@@ -67,23 +67,31 @@ func EnsureSchema(ctx context.Context, db *gorm.DB, schemaPath string) error {
 	if err != nil {
 		return err
 	}
-	if exists {
-		return nil
-	}
-
-	if schemaPath == "" {
-		if err := db.WithContext(ctx).Exec(database.TableSchema).Error; err != nil {
-			return fmt.Errorf("apply embedded schema: %w", err)
+	
+	if !exists {
+		if schemaPath == "" {
+			if err := db.WithContext(ctx).Exec(database.TableSchema).Error; err != nil {
+				return fmt.Errorf("apply embedded schema: %w", err)
+			}
+		} else {
+			schemaBytes, err := readSchema(schemaPath)
+			if err != nil {
+				return err
+			}
+			if err := db.WithContext(ctx).Exec(string(schemaBytes)).Error; err != nil {
+				return fmt.Errorf("apply schema: %w", err)
+			}
 		}
-		return nil
-	}
-
-	schemaBytes, err := readSchema(schemaPath)
-	if err != nil {
-		return err
-	}
-	if err := db.WithContext(ctx).Exec(string(schemaBytes)).Error; err != nil {
-		return fmt.Errorf("apply schema: %w", err)
+	} else {
+		// Table exists, check for missing rtc_epoch column
+		var hasColumn int
+		db.WithContext(ctx).Raw("SELECT COUNT(*) FROM pragma_table_info('telemetry') WHERE name='rtc_epoch'").Scan(&hasColumn)
+		if hasColumn == 0 {
+			// Add rtc_epoch if it doesn't exist (migration for older databases)
+			if err := db.WithContext(ctx).Exec("ALTER TABLE telemetry ADD COLUMN rtc_epoch INTEGER").Error; err != nil {
+				return fmt.Errorf("migrate rtc_epoch: %w", err)
+			}
+		}
 	}
 	return nil
 }
