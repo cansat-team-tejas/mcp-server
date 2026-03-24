@@ -11,9 +11,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/gofiber/fiber/v2/middleware/filesystem"
-
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3/middleware/static"
+	"github.com/gofiber/fiber/v3"
 
 	"goapp/internal/ai"
 	"goapp/internal/questions"
@@ -83,7 +82,7 @@ func validateSelectQuery(sql string) error {
 }
 
 func RegisterRoutes(app *fiber.App, h *Handlers, aiLimiter fiber.Handler, staticDir string) {
-	app.Get("/health", func(c *fiber.Ctx) error {
+	app.Get("/health", func(c fiber.Ctx) error {
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
 
@@ -97,12 +96,17 @@ func RegisterRoutes(app *fiber.App, h *Handlers, aiLimiter fiber.Handler, static
 
 	if staticDir != "" {
 		if _, err := os.Stat(staticDir); err == nil {
-			app.Use("/", filesystem.New(filesystem.Config{
-				Root:         http.Dir(staticDir),
-				Browse:       false,
-				Index:        "index.html",
-				NotFoundFile: "index.html",
+			app.Use("/", static.New(staticDir, static.Config{
+				Browse:     false,
+				IndexNames: []string{"index.html"},
 			}))
+            // React Router fallback
+			app.Use(func(c fiber.Ctx) error {
+				if c.Method() == "GET" && !strings.HasPrefix(c.Path(), "/api/") {
+					return c.SendFile(filepath.Join(staticDir, "index.html"))
+				}
+				return c.Next()
+			})
 		}
 	}
 }
@@ -110,9 +114,9 @@ func RegisterRoutes(app *fiber.App, h *Handlers, aiLimiter fiber.Handler, static
 
 
 
-func (h *Handlers) handleAsk(c *fiber.Ctx) error {
+func (h *Handlers) handleAsk(c fiber.Ctx) error {
 	var req AskRequest
-	if err := c.BodyParser(&req); err != nil {
+	if err := c.Bind().JSON(&req); err != nil {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid JSON payload"})
 	}
 	if strings.TrimSpace(req.Question) == "" {
@@ -136,6 +140,8 @@ func buildAnswerPayload(answer questions.Answer) fiber.Map {
 		"answer": fiber.Map{
 			"content": answer.Content,
 		},
+		"sql":     answer.SQL,
+		"details": answer.Details,
 	}
 
 	if len(answer.Commands) == 1 {
@@ -147,7 +153,7 @@ func buildAnswerPayload(answer questions.Answer) fiber.Map {
 	return payload
 }
 
-func (h *Handlers) handleTelemetry(c *fiber.Ctx) error {
+func (h *Handlers) handleTelemetry(c fiber.Ctx) error {
 	h.dbMutex.RLock()
 	currentDB := h.currentDB
 	h.dbMutex.RUnlock()
@@ -163,9 +169,9 @@ func (h *Handlers) handleTelemetry(c *fiber.Ctx) error {
 	return c.JSON(rows)
 }
 
-func (h *Handlers) handleQuery(c *fiber.Ctx) error {
+func (h *Handlers) handleQuery(c fiber.Ctx) error {
 	var req QueryRequest
-	if err := c.BodyParser(&req); err != nil {
+	if err := c.Bind().JSON(&req); err != nil {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid JSON payload"})
 	}
 
@@ -193,23 +199,23 @@ func (h *Handlers) handleQuery(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"result": result})
 }
 
-func requestContext(c *fiber.Ctx) context.Context {
-	if ctx := c.UserContext(); ctx != nil {
+func requestContext(c fiber.Ctx) context.Context {
+	if ctx := c.Context(); ctx != nil {
 		return ctx
 	}
 	return context.Background()
 }
 
-func (h *Handlers) handlePushData(c *fiber.Ctx) error {
+func (h *Handlers) handlePushData(c fiber.Ctx) error {
 	if h.readOnlyMode {
 		return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "telemetry writes are disabled in shared simulation mode"})
 	}
 
 	var row TelemetryRow
-	if err := c.BodyParser(&row); err != nil {
+	if err := c.Bind().JSON(&row); err != nil {
 		// Try uppercase schema
 		var upper TelemetryRowUpper
-		if err2 := c.BodyParser(&upper); err2 != nil {
+		if err2 := c.Bind().JSON(&upper); err2 != nil {
 			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid JSON payload"})
 		}
 		row = upper.ToLowerCase()
@@ -280,13 +286,13 @@ func (h *Handlers) handlePushData(c *fiber.Ctx) error {
 	})
 }
 
-func (h *Handlers) handleCreateDatabase(c *fiber.Ctx) error {
+func (h *Handlers) handleCreateDatabase(c fiber.Ctx) error {
 	if h.readOnlyMode {
 		return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "database creation is disabled in shared simulation mode"})
 	}
 
 	var req CreateDatabaseRequest
-	if err := c.BodyParser(&req); err != nil {
+	if err := c.Bind().JSON(&req); err != nil {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid JSON payload"})
 	}
 
@@ -344,7 +350,7 @@ func (h *Handlers) handleCreateDatabase(c *fiber.Ctx) error {
 	})
 }
 
-func (h *Handlers) handleGetCurrentDatabase(c *fiber.Ctx) error {
+func (h *Handlers) handleGetCurrentDatabase(c fiber.Ctx) error {
 	h.dbMutex.RLock()
 	currentPath := h.currentDBPath
 	h.dbMutex.RUnlock()

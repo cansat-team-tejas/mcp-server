@@ -18,9 +18,9 @@ import (
 type Answer struct {
 	Content  string
 	Commands []string
+	SQL      string
+	Details  map[string]any
 }
-
-
 
 var nonInstantQueryHints = regexp.MustCompile(`(?i)average|avg|min|max|trend|history|over\s+time|between|since|from|at\s+\d`)
 var currentSnapshotIntent = regexp.MustCompile(`(?i)latest|current|right\s*now|now\b|status|how\s+is|how\s+are|performing|live`)
@@ -58,7 +58,6 @@ func shouldForceCurrentSnapshot(question string, currentRow map[string]any) bool
 	return false
 }
 
-
 func AnswerQuestion(ctx context.Context, question string, db *gorm.DB, client *ai.Client, currentRow map[string]any) (Answer, error) {
 	commandEntries := commands.DetectCommandRequest(question)
 
@@ -75,10 +74,14 @@ func AnswerQuestion(ctx context.Context, question string, db *gorm.DB, client *a
 		commandContext = "Potentially relevant system commands detected:\n" + strings.Join(labels, "\n")
 	}
 
-
 	if db == nil {
-
-		ans, err := answerBasicQuestion(ctx, question, client, commandContext)
+		var ans Answer
+		var err error
+		if currentRow != nil && len(currentRow) > 0 {
+			ans, err = answerWithCurrentRowOnly(ctx, question, client, currentRow, commandContext)
+		} else {
+			ans, err = answerBasicQuestion(ctx, question, client, commandContext)
+		}
 		if err == nil {
 			ans.Commands = commandCodes
 		}
@@ -86,19 +89,21 @@ func AnswerQuestion(ctx context.Context, question string, db *gorm.DB, client *a
 	}
 
 	if has, err := telemetry.HasData(ctx, db); err == nil && !has {
-
-		ans, err := answerBasicQuestion(ctx, question, client, commandContext)
+		var ans Answer
+		var err error
+		if currentRow != nil && len(currentRow) > 0 {
+			ans, err = answerWithCurrentRowOnly(ctx, question, client, currentRow, commandContext)
+		} else {
+			ans, err = answerBasicQuestion(ctx, question, client, commandContext)
+		}
 		if err == nil {
 			ans.Commands = commandCodes
 		}
 		return ans, err
 	}
 
-
-	// We no longer force snapshot mode here to allow the AI to be more conversational 
+	// We no longer force snapshot mode here to allow the AI to be more conversational
 	// and use historical data even for "status" style questions.
-
-
 
 	rawSQL, err := client.GenerateSQL(ctx, question)
 
@@ -167,7 +172,14 @@ func AnswerQuestion(ctx context.Context, question string, db *gorm.DB, client *a
 		return Answer{}, fmt.Errorf("llm response: %w", err)
 	}
 
-	return Answer{Content: response, Commands: commandCodes}, nil
+	return Answer{
+		Content:  response,
+		Commands: commandCodes,
+		SQL:      sql,
+		Details: map[string]any{
+			"row_count": len(rows),
+		},
+	}, nil
 }
 
 // answerWithCurrentRowOnly handles greetings or status requests using only the current telemetry snapshot
@@ -184,7 +196,7 @@ func answerWithCurrentRowOnly(ctx context.Context, question string, client *ai.C
 		systemPrompt += "\n\n" + commandCtx
 	}
 
-	userMessage := fmt.Sprintf("User question: %s\n\nContext (Current Telemetry Snapshot):\n%s\n\nPlease respond conversationally as the mission control assistant. Reference the values above if relevant to the status or just greet the user.", question, contextText)
+	userMessage := fmt.Sprintf("User question: %s\n\nContext (Current Telemetry Snapshot):\n%s\n\nPlease respond conversationally as the mission control assistant. The database history is currently unavailable, so you only have access to this real-time snapshot. Use these values to answer the user's question. If the user asks for historical aggregations (like averages or trends) that cannot be answered from a single snapshot, politely explain that you are currently operating in a live-stream mode without historical database access.", question, contextText)
 
 	messages := []ai.Message{
 		{Role: "system", Content: systemPrompt},

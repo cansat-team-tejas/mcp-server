@@ -8,8 +8,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/limiter"
+	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/middleware/limiter"
 
 	"goapp/internal/ai"
 	"goapp/internal/api"
@@ -53,11 +53,10 @@ func main() {
 	aiClient := ai.NewClient(cfg.GeminiAPIKey, cfg.GeminiModel)
 
 	app := fiber.New(fiber.Config{
-		DisableStartupMessage: false,
-		BodyLimit:             256 * 1024,
+		BodyLimit: 256 * 1024,
 	})
 
-	app.Use(func(c *fiber.Ctx) error {
+	app.Use(func(c fiber.Ctx) error {
 		c.Set("X-Content-Type-Options", "nosniff")
 		c.Set("X-Frame-Options", "DENY")
 		c.Set("Referrer-Policy", "no-referrer")
@@ -66,7 +65,7 @@ func main() {
 	})
 
 	// Simplified CORS: allow any origin to access the telemetry API.
-	app.Use(func(c *fiber.Ctx) error {
+	app.Use(func(c fiber.Ctx) error {
 		c.Set("Access-Control-Allow-Origin", "*")
 		c.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE, PUT")
 		c.Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key, Authorization")
@@ -79,7 +78,7 @@ func main() {
 
 	// API key authentication — skip /health so Docker healthcheck still works
 	if cfg.APIKey != "" {
-		app.Use(func(c *fiber.Ctx) error {
+		app.Use(func(c fiber.Ctx) error {
 			if c.Path() == "/health" {
 				return c.Next()
 			}
@@ -93,10 +92,10 @@ func main() {
 	app.Use(limiter.New(limiter.Config{
 		Max:        120,
 		Expiration: 1 * time.Minute,
-		KeyGenerator: func(c *fiber.Ctx) string {
+		KeyGenerator: func(c fiber.Ctx) string {
 			return c.IP()
 		},
-		LimitReached: func(c *fiber.Ctx) error {
+		LimitReached: func(c fiber.Ctx) error {
 			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{"error": "global rate limit exceeded"})
 		},
 	}))
@@ -105,10 +104,10 @@ func main() {
 	aiLimiter := limiter.New(limiter.Config{
 		Max:        8,
 		Expiration: 1 * time.Minute,
-		KeyGenerator: func(c *fiber.Ctx) string {
+		KeyGenerator: func(c fiber.Ctx) string {
 			return c.IP()
 		},
-		LimitReached: func(c *fiber.Ctx) error {
+		LimitReached: func(c fiber.Ctx) error {
 			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{"error": "ai rate limit exceeded"})
 		},
 	})
